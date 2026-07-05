@@ -230,6 +230,25 @@ test('a SimulationReverted edge is dropped and the rest of the bundle resubmits'
   assert.deepEqual(plan.dropped, [{ chain: 11155111, target: '0xs1' }]);
 });
 
+test('when EVERY fireable edge sim-reverts: graceful result, then backoff reroutes future scans', async () => {
+  fx.walk = mkWalk('0xbad');
+  fx.snapshots = divergedSnapshots();
+  fx.submitErrors.push(Object.assign(new Error('HTTP 406'), {
+    status: 406,
+    body: '{"SimulationReverted":{"transaction":{"chain":11155111,"target":"0xbad","data":"0x","value":"0x0"}}}',
+  }));
+  const before = fx.submitted.length;
+  const r = await scanGroup(db.groupById(groupId)); // no throw
+  assert.deepEqual(r.simReverted, [{ chain: 11155111, target: '0xbad' }]);
+  assert.equal(fx.submitted.length, before); // nothing submitted, nothing paid
+
+  // Next scan: the edge is backed off -> unusable -> the pair is unreachable
+  // over this one-edge mesh, with no Relayr attempt at all.
+  const r2 = await scanGroup(db.groupById(groupId));
+  assert.equal(fx.submitted.length, before);
+  assert.equal(r2.unreachable.length, 1);
+});
+
 test('non-simulation relayr failures still abort the scan for that group', async () => {
   fx.walk = mkWalk('0xf3');
   fx.snapshots = divergedSnapshots();

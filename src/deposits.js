@@ -42,7 +42,7 @@ export async function claimDeposit({ txHash, chainId, projectChainId, projectId 
   db.insertDeposit({ txHash, chainId, from: tx.from, amountWei: tx.value, groupId: group.id });
   const balance = db.adjustBalance(group.id, tx.value);
   if (group.status === 'underfunded') db.setStatus(group.id, 'active');
-  return { credited: tx.value.toString(), balance: balance.toString() };
+  return { credited: tx.value.toString(), balance: balance.toString(), groupKey: group.group_key };
 }
 
 export function httpError(status, message) {

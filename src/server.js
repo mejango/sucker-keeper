@@ -138,6 +138,9 @@ async function handle(req, res) {
       projectChainId: Number(body.projectChainId ?? body.chainId),
       projectId: String(body.projectId),
     });
+    if (!result.pending) {
+      result.label = await projectLabel(Number(body.projectChainId ?? body.chainId), String(body.projectId));
+    }
     return json(res, result.pending ? 202 : 201, result);
   }
 

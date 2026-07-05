@@ -281,6 +281,10 @@ $('rg-btn').onclick = async function () {
 };
 
 // ---- fund ----
+function fundedName(d) {
+  var ref = chainName(Number($('fd-pchain').value)) + ' project ' + $('fd-project').value.trim();
+  return (d.label ? d.label + ' — ' : '') + ref + ' (group ' + d.groupKey + ')';
+}
 async function claim(txHash) {
   return api('POST', '/deposits', {
     txHash: txHash,
@@ -304,7 +308,7 @@ $('fd-send').onclick = async function () {
     for (var i = 0; i < 60; i++) {
       await new Promise(function (r) { setTimeout(r, 5000); });
       var d = await claim(hash);
-      if (d.credited) return out('fd-out', 'credited ' + fmtEth(d.credited) + ' — project balance now ' + fmtEth(d.balance));
+      if (d.credited) return out('fd-out', 'credited ' + fmtEth(d.credited) + ' to ' + fundedName(d) + ' — its balance is now ' + fmtEth(d.balance));
       out('fd-out', 'sent ' + hash + ' — still waiting for a confirmation…');
     }
     out('fd-out', 'tx not confirmed yet — claim the hash manually below once it lands: ' + hash, true);
@@ -314,7 +318,7 @@ $('fd-claim').onclick = async function () {
   try {
     var d = await claim($('fd-hash').value.trim());
     if (d.pending) return out('fd-out', d.message + ' — try again in a moment.');
-    out('fd-out', 'credited ' + fmtEth(d.credited) + ' — project balance now ' + fmtEth(d.balance));
+    out('fd-out', 'credited ' + fmtEth(d.credited) + ' to ' + fundedName(d) + ' — its balance is now ' + fmtEth(d.balance));
   } catch (e) { out('fd-out', e.message, true); }
 };
 

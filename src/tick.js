@@ -22,6 +22,22 @@ const SYNC_TIMEOUT_S = 24 * 3600;
 // re-paid while its message is still in flight.
 const EDGE_COOLDOWN_S = 30 * 60;
 
+// Edges whose Relayr simulation reverted recently. Observed live: the native
+// eth->arb retryable passes our eth_call probe (even at 2x) yet keeps
+// reverting in Relayr's simulation, and the planner keeps picking it because
+// it quotes cheapest. Backing a sim-reverted edge off as unusable makes
+// Dijkstra route around it (e.g. eth->op->arb over CCIP) instead of retrying
+// a known-bad edge every scan.
+// ponytail: in-memory — a redeploy retries each bad edge once, which is free
+// (unpaid bundles cost nothing).
+const SIM_FAIL_BACKOFF_S = 2 * 3600;
+const simFailures = new Map(); // `${chain}:${sucker}` -> unix seconds of last SimulationReverted
+
+function simBackoffActive(chain, sucker) {
+  const at = simFailures.get(`${chain}:${sucker}`);
+  return at != null && Date.now() / 1000 - at < SIM_FAIL_BACKOFF_S;
+}
+
 // Relayr simulates every tx before quoting and 406s the WHOLE bundle if any
 // one reverts (e.g. a bridge fee that drifted past its pad). Rather than lose
 // the round, drop the offending edge and resubmit the rest — the dropped edge
@@ -42,11 +58,14 @@ async function submitDroppingRevertedEdges(txs) {
     } catch (err) {
       const failing = parseSimulationRevertedTx(err);
       if (!failing) throw err;
+      simFailures.set(`${failing.chain}:${failing.target}`, Date.now() / 1000);
       dropped.push(failing);
       remaining = remaining.filter((t) => !(Number(t.chain) === failing.chain && t.target.toLowerCase() === failing.target));
     }
   }
-  throw new Error(`relayr simulation rejected the bundle even after dropping ${dropped.length} edge(s)`);
+  // Every fireable edge simulated as reverting (or attempts ran out). Not an
+  // error — nothing was paid; the backoff reroutes future rounds.
+  return { allDropped: true, dropped };
 }
 
 export async function scanGroup(group) {
@@ -75,6 +94,10 @@ export async function scanGroup(group) {
 
   const quoted = [];
   for (const e of walk.edges) {
+    if (simBackoffActive(e.from, e.sucker)) {
+      quoted.push({ ...e, usable: false, value: 0n, cost: 0n, reason: 'relayr-simulation-reverted-recently' });
+      continue;
+    }
     const q = await quoteEdge(e);
     quoted.push({ ...e, usable: q.usable, value: q.value ?? 0n, cost: (q.value ?? 0n) + HOP_PENALTY, family: q.family, reason: q.reason });
   }
@@ -97,7 +120,11 @@ export async function scanGroup(group) {
   // Submit first: the bundle is a free quote until it's paid. If the group
   // can't afford it, let it expire unpaid.
   const txs = fireable.map((e) => ({ chain: e.from, target: e.sucker, data: SYNC_CALLDATA, value: e.value }));
-  const { bundleUuid, paymentInfo, submittedTxs, dropped } = await submitDroppingRevertedEdges(txs);
+  const submission = await submitDroppingRevertedEdges(txs);
+  if (submission.allDropped) {
+    return { groupKey: freshKey, inSync: false, stale: stale.length, simReverted: submission.dropped };
+  }
+  const { bundleUuid, paymentInfo, submittedTxs, dropped } = submission;
   const submittedEdges = p.edges.filter((e) =>
     submittedTxs.some((t) => t.chain === e.from && t.target === e.sucker));
   const options = paymentInfo.filter((o) => BigInt(o.amount) > 0n);
