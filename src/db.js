@@ -33,6 +33,16 @@ export function init(path = process.env.DB_PATH || './keeper.db') {
       group_id INTEGER NOT NULL REFERENCES groups(id),
       credited_at INTEGER NOT NULL DEFAULT (unixepoch())
     );
+    CREATE TABLE IF NOT EXISTS sponsorships (
+      id INTEGER PRIMARY KEY,
+      group_id INTEGER NOT NULL REFERENCES groups(id),
+      sponsor_address TEXT NOT NULL,
+      threshold_pct REAL NOT NULL,
+      balance_wei TEXT NOT NULL DEFAULT '0',
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','underfunded')),
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      UNIQUE (group_id, sponsor_address)
+    );
     CREATE TABLE IF NOT EXISTS syncs (
       id INTEGER PRIMARY KEY,
       group_id INTEGER NOT NULL REFERENCES groups(id),
@@ -45,7 +55,55 @@ export function init(path = process.env.DB_PATH || './keeper.db') {
       resolved_at INTEGER
     );
   `);
+  // Migration from the single-registrant model: seed each group's first
+  // sponsorship from its legacy registrant/threshold/balance columns.
+  db.exec(`
+    INSERT INTO sponsorships (group_id, sponsor_address, threshold_pct, balance_wei, status)
+    SELECT id, registrant_address, threshold_pct, balance_wei,
+           CASE status WHEN 'underfunded' THEN 'underfunded' ELSE 'active' END
+    FROM groups g
+    WHERE NOT EXISTS (SELECT 1 FROM sponsorships s WHERE s.group_id = g.id)
+  `);
   return db;
+}
+
+// ---- sponsorships: any address backs any group with its own threshold + pot ----
+
+export function sponsorshipsOf(groupId) {
+  return db.prepare('SELECT * FROM sponsorships WHERE group_id = ? ORDER BY created_at').all(Number(groupId));
+}
+
+export function sponsorshipOf(groupId, sponsor) {
+  return db.prepare('SELECT * FROM sponsorships WHERE group_id = ? AND sponsor_address = ?')
+    .get(Number(groupId), sponsor.toLowerCase());
+}
+
+export function createSponsorship({ groupId, sponsor, thresholdPct }) {
+  const { lastInsertRowid } = db.prepare('INSERT INTO sponsorships (group_id, sponsor_address, threshold_pct) VALUES (?, ?, ?)')
+    .run(Number(groupId), sponsor.toLowerCase(), thresholdPct);
+  return Number(lastInsertRowid);
+}
+
+export function setSponsorThreshold(sponsorshipId, thresholdPct) {
+  db.prepare('UPDATE sponsorships SET threshold_pct = ? WHERE id = ?').run(thresholdPct, Number(sponsorshipId));
+}
+
+export function setSponsorStatus(sponsorshipId, status) {
+  db.prepare('UPDATE sponsorships SET status = ? WHERE id = ?').run(status, Number(sponsorshipId));
+}
+
+export function adjustSponsorBalance(sponsorshipId, deltaWei) {
+  const row = db.prepare('SELECT balance_wei FROM sponsorships WHERE id = ?').get(Number(sponsorshipId));
+  const next = BigInt(row.balance_wei) + BigInt(deltaWei);
+  db.prepare('UPDATE sponsorships SET balance_wei = ? WHERE id = ?').run(next.toString(), Number(sponsorshipId));
+  return next;
+}
+
+export function sponsorshipsByAddress(sponsor) {
+  return db.prepare(`
+    SELECT s.*, g.group_key FROM sponsorships s JOIN groups g ON g.id = s.group_id
+    WHERE s.sponsor_address = ? ORDER BY s.created_at DESC
+  `).all(sponsor.toLowerCase());
 }
 
 export function createGroup({ groupKey, thresholdPct, registrant, networkClass, members }) {
@@ -129,13 +187,21 @@ export function pendingSyncs() {
 }
 
 // Operator remediation: move a deposit (and its credit) to another group —
-// e.g. a claim that was attributed to the wrong project id.
+// e.g. a claim that was attributed to the wrong project id. The credit stays
+// with the depositor's own sponsorship on both sides.
 export function reattributeDeposit(txHash, toGroupId) {
   const dep = depositByHash(txHash);
   if (!dep) throw new Error('deposit not found');
   if (dep.group_id === Number(toGroupId)) throw new Error('deposit already attributed to that group');
-  adjustBalance(dep.group_id, -BigInt(dep.amount_wei));
-  adjustBalance(toGroupId, BigInt(dep.amount_wei));
+  const fromSponsorship = sponsorshipOf(dep.group_id, dep.from_address);
+  if (!fromSponsorship) throw new Error('depositor has no sponsorship on the source group');
+  let toSponsorship = sponsorshipOf(toGroupId, dep.from_address);
+  if (!toSponsorship) {
+    createSponsorship({ groupId: toGroupId, sponsor: dep.from_address, thresholdPct: fromSponsorship.threshold_pct });
+    toSponsorship = sponsorshipOf(toGroupId, dep.from_address);
+  }
+  adjustSponsorBalance(fromSponsorship.id, -BigInt(dep.amount_wei));
+  adjustSponsorBalance(toSponsorship.id, BigInt(dep.amount_wei));
   db.prepare('UPDATE deposits SET group_id = ? WHERE tx_hash = ?').run(Number(toGroupId), dep.tx_hash);
   return dep;
 }

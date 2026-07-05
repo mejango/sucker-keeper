@@ -32,15 +32,19 @@ function readBody(req) {
 }
 
 function groupView(group) {
+  const sponsorships = db.sponsorshipsOf(group.id);
+  const funded = sponsorships.filter((s) => BigInt(s.balance_wei) > 0n);
   return {
     groupKey: group.group_key,
     members: db.membersOf(group.id),
-    thresholdPct: group.threshold_pct,
-    registrant: group.registrant_address,
     networkClass: group.network_class,
-    balanceWei: group.balance_wei,
+    // The tightest funded threshold is what actually governs syncing.
+    effectiveThresholdPct: funded.length ? Math.min(...funded.map((s) => s.threshold_pct)) : null,
+    balanceWei: sponsorships.reduce((t, s) => t + BigInt(s.balance_wei), 0n).toString(),
     totalCostWei: db.totalCostOf(group.id).toString(),
-    status: group.status,
+    sponsorships: sponsorships.map((s) => ({
+      sponsor: s.sponsor_address, thresholdPct: s.threshold_pct, balanceWei: s.balance_wei, status: s.status,
+    })),
     syncs: db.syncsOf(group.id).map((s) => ({
       state: s.state, bundleUuid: s.relayr_bundle_uuid, quotedCostWei: s.quoted_cost_wei,
       finalCostWei: s.final_cost_wei, createdAt: s.created_at, plan: JSON.parse(s.plan_json),
@@ -48,29 +52,42 @@ function groupView(group) {
   };
 }
 
+// Registering is open and non-exclusive: it ensures the group exists and adds
+// (or 409s on) the caller's OWN sponsorship — their threshold, their balance.
+// Other sponsors of the same project are unaffected.
 async function registerProject(body) {
-  const { chainId, projectId, registrant } = body;
+  const { chainId, projectId } = body;
+  const sponsor = body.sponsor ?? body.registrant;
   const thresholdPct = Number(body.thresholdPct ?? 1);
   if (!isSupported(chainId)) throw httpError(400, `unsupported chain ${chainId}`);
   if (!projectId || BigInt(projectId) <= 0n) throw httpError(400, 'invalid projectId');
-  if (!isAddress(registrant || '')) throw httpError(400, 'registrant must be an address');
+  if (!isAddress(sponsor || '')) throw httpError(400, 'sponsor must be an address');
   if (!(thresholdPct > 0 && thresholdPct <= 100)) throw httpError(400, 'thresholdPct must be in (0, 100]');
 
-  const walk = await walkGroup(chainId, projectId);
-  if (walk.members.length < 2 || walk.edges.length === 0) {
-    throw httpError(422, 'project has no sucker group on supported chains — nothing to keep in sync');
-  }
-  const classes = new Set(walk.members.map((m) => networkClass(m.chainId)));
-  if (classes.size > 1) throw httpError(422, 'group spans mainnet and testnet chains');
-  for (const m of walk.members) {
-    if (db.groupByMember(m.chainId, m.projectId)) throw httpError(409, 'group already registered');
+  let group = db.groupByMember(chainId, projectId);
+  if (!group) {
+    const walk = await walkGroup(chainId, projectId);
+    if (walk.members.length < 2 || walk.edges.length === 0) {
+      throw httpError(422, 'project has no sucker group on supported chains — nothing to keep in sync');
+    }
+    const classes = new Set(walk.members.map((m) => networkClass(m.chainId)));
+    if (classes.size > 1) throw httpError(422, 'group spans mainnet and testnet chains');
+    for (const m of walk.members) {
+      const existing = db.groupByMember(m.chainId, m.projectId);
+      if (existing) { group = existing; break; }
+    }
+    if (!group) {
+      const id = db.createGroup({
+        groupKey: groupKeyOf(walk.members), thresholdPct, registrant: sponsor,
+        networkClass: [...classes][0], members: walk.members,
+      });
+      group = db.groupById(id);
+    }
   }
 
-  const groupKey = groupKeyOf(walk.members);
-  const id = db.createGroup({
-    groupKey, thresholdPct, registrant, networkClass: [...classes][0], members: walk.members,
-  });
-  return groupView(db.groupById(id));
+  if (db.sponsorshipOf(group.id, sponsor)) throw httpError(409, 'this address already sponsors the project — fund it or update its threshold');
+  db.createSponsorship({ groupId: group.id, sponsor, thresholdPct });
+  return groupView(db.groupById(group.id));
 }
 
 const INDEX_HTML = new URL('../web/index.html', import.meta.url);
@@ -137,6 +154,8 @@ async function handle(req, res) {
       chainId: Number(body.depositChainId ?? body.chainId),
       projectChainId: Number(body.projectChainId ?? body.chainId),
       projectId: String(body.projectId),
+      expiresAt: Number(body.expiresAt),
+      signature: body.signature,
     });
     if (!result.pending) {
       result.label = await projectLabel(Number(body.projectChainId ?? body.chainId), String(body.projectId));
@@ -153,12 +172,13 @@ async function handle(req, res) {
     const to = db.groupByMember(Number(body.toChainId), String(body.toProjectId));
     if (!to) throw httpError(404, 'target project not registered');
     const dep = db.reattributeDeposit(String(body.txHash), to.id);
+    const pooled = (gid) => db.sponsorshipsOf(gid).reduce((t, sp) => t + BigInt(sp.balance_wei), 0n).toString();
     return json(res, 200, {
       moved: dep.amount_wei,
       txHash: dep.tx_hash,
       toGroup: to.group_key,
-      toBalance: db.groupById(to.id).balance_wei,
-      fromBalance: db.groupById(dep.group_id).balance_wei,
+      toBalance: pooled(to.id),
+      fromBalance: pooled(dep.group_id),
     });
   }
 
@@ -179,19 +199,25 @@ async function handle(req, res) {
     }
 
     if (req.method === 'PATCH') {
-      const { thresholdPct, expiresAt, signature } = await readBody(req);
+      const { thresholdPct, expiresAt, signature, sponsor } = await readBody(req);
       if (!(thresholdPct > 0 && thresholdPct <= 100)) throw httpError(400, 'thresholdPct must be in (0, 100]');
       if (!expiresAt || expiresAt < Date.now() / 1000) throw httpError(400, 'expired or missing expiresAt');
+      if (!isAddress(sponsor || '')) throw httpError(400, 'sponsor must be an address');
+      const sponsorship = db.sponsorshipOf(group.id, sponsor);
+      if (!sponsorship) throw httpError(404, 'that address does not sponsor this project');
       const message = `keeper:set-threshold:${group.group_key}:${thresholdPct}:${expiresAt}`;
-      const ok = await verifyMessage({ address: group.registrant_address, message, signature }).catch(() => false);
-      if (!ok) throw httpError(403, 'signature does not match registrant');
-      db.setThreshold(group.id, Number(thresholdPct));
+      const ok = await verifyMessage({ address: sponsor, message, signature }).catch(() => false);
+      if (!ok) throw httpError(403, 'signature does not match sponsor');
+      db.setSponsorThreshold(sponsorship.id, Number(thresholdPct));
       return json(res, 200, groupView(db.groupById(group.id)));
     }
   }
 
   if (req.method === 'GET' && parts[0] === 'account' && parts.length === 2) {
     return json(res, 200, {
+      sponsorships: db.sponsorshipsByAddress(parts[1]).map((s) => ({
+        groupKey: s.group_key, thresholdPct: s.threshold_pct, balanceWei: s.balance_wei, status: s.status,
+      })),
       deposits: db.depositsByAddress(parts[1]).map((d) => ({
         txHash: d.tx_hash, chainId: d.chain_id, amountWei: d.amount_wei, creditedAt: d.credited_at,
       })),

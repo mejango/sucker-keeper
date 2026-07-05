@@ -12,6 +12,9 @@ const p = (f) => new URL(f, import.meta.url).pathname;
 const KEEPER_PK = `0x${'33'.repeat(32)}`;
 const DEPOSIT_ADDRESS = privateKeyToAccount(KEEPER_PK).address.toLowerCase();
 const registrantAccount = privateKeyToAccount(`0x${'11'.repeat(32)}`);
+const depositorAccount = privateKeyToAccount(`0x${'55'.repeat(32)}`);
+const signClaim = (acct, { txHash, projectChainId, projectId, expiresAt }) =>
+  acct.signMessage({ message: `keeper:claim:${txHash.toLowerCase()}:${projectChainId}:${projectId}:${expiresAt}` });
 
 process.env.DB_PATH = join(mkdtempSync(join(tmpdir(), 'keeper-api-')), 'api.db');
 process.env.PORT = '0';
@@ -86,15 +89,18 @@ const TESTNET_WALK = {
   unsupported: [],
 };
 
-test('POST /projects registers a group addressable by any member', async () => {
+test('POST /projects registers a sponsorship, addressable by any member', async () => {
   fx.walk = TESTNET_WALK;
   const { status, body } = await api('POST', '/projects', {
-    chainId: 11155111, projectId: '5', registrant: registrantAccount.address, thresholdPct: 2,
+    chainId: 11155111, projectId: '5', sponsor: registrantAccount.address, thresholdPct: 2,
   });
   assert.equal(status, 201);
   assert.equal(body.groupKey, '84532:9'); // smallest chainId member, not the anchor
   assert.equal(body.networkClass, 'testnet');
   assert.equal(body.members.length, 2);
+  assert.equal(body.sponsorships.length, 1);
+  assert.equal(body.sponsorships[0].thresholdPct, 2);
+  assert.equal(body.effectiveThresholdPct, null); // nobody funded yet
 
   const other = await api('GET', '/projects/84532/9');
   assert.equal(other.status, 200);
@@ -118,56 +124,80 @@ test('POST /projects rejections: bad input, no group, mixed classes, duplicate',
   assert.equal((await api('POST', '/projects', { chainId: 1, projectId: '1', registrant: reg })).status, 422);
 
   fx.walk = TESTNET_WALK; // same group as the first test, anchored via the other member
-  const dup = await api('POST', '/projects', { chainId: 84532, projectId: '9', registrant: reg });
-  assert.equal(dup.status, 409);
+  const dup = await api('POST', '/projects', { chainId: 84532, projectId: '9', sponsor: reg });
+  assert.equal(dup.status, 409); // same sponsor twice: no
+
+  // A DIFFERENT sponsor on the same project is welcome — non-exclusive.
+  const second = await api('POST', '/projects', { chainId: 84532, projectId: '9', sponsor: depositorAccount.address, thresholdPct: 7 });
+  assert.equal(second.status, 201);
+  assert.equal(second.body.sponsorships.length, 2);
 });
 
 test('GET /projects/:chainId/:projectId 404s for unknown members', async () => {
   assert.equal((await api('GET', '/projects/1/12345')).status, 404);
 });
 
-test('PATCH threshold: real EIP-191 signature accepted, others rejected', async () => {
+test('PATCH threshold: sponsor-signed, only affects that sponsorship', async () => {
   const expiresAt = Math.floor(Date.now() / 1000) + 600;
   const message = `keeper:set-threshold:84532:9:5:${expiresAt}`;
   const signature = await registrantAccount.signMessage({ message });
 
-  const ok = await api('PATCH', '/projects/11155111/5', { thresholdPct: 5, expiresAt, signature });
+  const ok = await api('PATCH', '/projects/11155111/5', { thresholdPct: 5, expiresAt, signature, sponsor: registrantAccount.address });
   assert.equal(ok.status, 200);
-  assert.equal(ok.body.thresholdPct, 5);
+  const mine = ok.body.sponsorships.find((s) => s.sponsor === registrantAccount.address.toLowerCase());
+  const theirs = ok.body.sponsorships.find((s) => s.sponsor === depositorAccount.address.toLowerCase());
+  assert.equal(mine.thresholdPct, 5);
+  assert.equal(theirs.thresholdPct, 7); // untouched
 
   const wrongSigner = privateKeyToAccount(`0x${'22'.repeat(32)}`);
   const forged = await wrongSigner.signMessage({ message: `keeper:set-threshold:84532:9:7:${expiresAt}` });
-  assert.equal((await api('PATCH', '/projects/11155111/5', { thresholdPct: 7, expiresAt, signature: forged })).status, 403);
+  assert.equal((await api('PATCH', '/projects/11155111/5', { thresholdPct: 7, expiresAt, signature: forged, sponsor: registrantAccount.address })).status, 403);
 
   const stale = await registrantAccount.signMessage({ message: `keeper:set-threshold:84532:9:7:1` });
-  assert.equal((await api('PATCH', '/projects/11155111/5', { thresholdPct: 7, expiresAt: 1, signature: stale })).status, 400);
+  assert.equal((await api('PATCH', '/projects/11155111/5', { thresholdPct: 7, expiresAt: 1, signature: stale, sponsor: registrantAccount.address })).status, 400);
 
-  // Replaying the valid signature with a different threshold fails (value is signed).
-  assert.equal((await api('PATCH', '/projects/11155111/5', { thresholdPct: 9, expiresAt, signature })).status, 403);
+  // A non-sponsor can't set anything.
+  const outsider = privateKeyToAccount(`0x${'66'.repeat(32)}`);
+  const sig2 = await outsider.signMessage({ message });
+  assert.equal((await api('PATCH', '/projects/11155111/5', { thresholdPct: 5, expiresAt, signature: sig2, sponsor: outsider.address })).status, 404);
 });
 
-test('POST /deposits credits a verified transfer and blocks replay', async () => {
+test('POST /deposits: sender-signed claim credits the SENDER\'s own sponsorship; forgeries rejected', async () => {
   const value = 5n * 10n ** 18n;
-  fx.tx = { to: DEPOSIT_ADDRESS, from: '0xF00000000000000000000000000000000000000F', value };
+  fx.tx = { to: DEPOSIT_ADDRESS, from: depositorAccount.address, value };
   fx.receipt = { status: 'success', blockNumber: 100n };
   fx.head = 105n;
+  const expiresAt = Math.floor(Date.now() / 1000) + 3600;
+  const target = { txHash: '0xdd01', projectChainId: 11155111, projectId: '5', expiresAt };
 
-  const ok = await api('POST', '/deposits', { txHash: '0xdd01', depositChainId: 84532, projectChainId: 11155111, projectId: '5' });
+  // A thief who saw the tx on-chain cannot claim it: signature must be tx.from's.
+  const thief = privateKeyToAccount(`0x${'77'.repeat(32)}`);
+  const stolenSig = await signClaim(thief, target);
+  const theft = await api('POST', '/deposits', { txHash: '0xdd01', depositChainId: 84532, projectChainId: 11155111, projectId: '5', expiresAt, signature: stolenSig });
+  assert.equal(theft.status, 403);
+
+  const signature = await signClaim(depositorAccount, target);
+  const ok = await api('POST', '/deposits', { txHash: '0xdd01', depositChainId: 84532, projectChainId: 11155111, projectId: '5', expiresAt, signature });
   assert.equal(ok.status, 201);
   assert.equal(ok.body.credited, value.toString());
-  assert.equal(ok.body.balance, value.toString());
+  assert.equal(ok.body.sponsor, depositorAccount.address.toLowerCase());
+  assert.equal(ok.body.balance, value.toString()); // the sender's own sponsorship pot
 
-  assert.equal((await api('POST', '/deposits', { txHash: '0xdd01', depositChainId: 84532, projectChainId: 11155111, projectId: '5' })).status, 409);
+  assert.equal((await api('POST', '/deposits', { txHash: '0xdd01', depositChainId: 84532, projectChainId: 11155111, projectId: '5', expiresAt, signature })).status, 409);
 
-  const acct = await api('GET', `/account/${fx.tx.from}`);
+  const acct = await api('GET', `/account/${depositorAccount.address}`);
   assert.equal(acct.body.deposits.length, 1);
   assert.equal(acct.body.deposits[0].amountWei, value.toString());
+  assert.ok(acct.body.sponsorships.some((s) => s.groupKey === '84532:9' && s.balanceWei === value.toString()));
 });
 
 test('POST /deposits rejections: wrong recipient, reverted, unconfirmed, class mismatch, unknown project', async () => {
-  const good = { to: DEPOSIT_ADDRESS, from: '0xF00000000000000000000000000000000000000F', value: 10n ** 18n };
-  const claim = (txHash, over = {}) => api('POST', '/deposits', {
-    txHash, depositChainId: 84532, projectChainId: 11155111, projectId: '5', ...over,
+  const good = { to: DEPOSIT_ADDRESS, from: depositorAccount.address, value: 10n ** 18n };
+  const expiresAt = Math.floor(Date.now() / 1000) + 3600;
+  const claim = async (txHash, over = {}) => api('POST', '/deposits', {
+    txHash, depositChainId: 84532, projectChainId: 11155111, projectId: '5', expiresAt,
+    signature: await signClaim(depositorAccount, { txHash, projectChainId: over.projectChainId ?? 11155111, projectId: over.projectId ?? '5', expiresAt }),
+    ...over,
   });
 
   fx.tx = { ...good, to: '0x0000000000000000000000000000000000000bad' };
@@ -215,7 +245,7 @@ test('admin reattribute-deposit moves a misfiled credit between groups', async (
     edges: [{ from: 11155111, to: 84532, sucker: '0xs2' }, { from: 84532, to: 11155111, sucker: '0xs2' }],
     unsupported: [],
   };
-  await api('POST', '/projects', { chainId: 11155111, projectId: '7', registrant: registrantAccount.address });
+  await api('POST', '/projects', { chainId: 11155111, projectId: '7', sponsor: registrantAccount.address });
 
   const move = (headers) => fetch(base + '/admin/reattribute-deposit', {
     method: 'POST',
@@ -234,7 +264,7 @@ test('admin reattribute-deposit moves a misfiled credit between groups', async (
   assert.equal(body.toBalance, (5n * 10n ** 18n).toString());
 
   const from = await api('GET', '/projects/11155111/5');
-  assert.equal(from.body.balanceWei, '0'); // original group debited back
+  assert.equal(from.body.balanceWei, '0'); // original group's pool debited back
   delete process.env.ADMIN_TOKEN;
 });
 

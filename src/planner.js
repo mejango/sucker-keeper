@@ -51,35 +51,93 @@ export function pathTo(target, { dist, prevEdge }) {
   return path;
 }
 
+// Per-pair shortest paths overcount when many pairs could share edges: a
+// full-mesh CCIP group buys three separate L2->mainnet legs when ONE could
+// carry every record (a sync forwards everything the sender holds). Hub
+// consolidation captures that: route every stale source INTO a hub chain,
+// then the hub OUT to every stale viewer — mainnet then touches the mesh via
+// at most one inbound and one outbound edge. We price both shapes on unique
+// edges and take the cheaper.
+function pairPaths({ usable, stale }) {
+  const bySource = new Map();
+  const chosen = new Map(); // `${from}:${sucker}` -> {edge, pairs: [{source, viewer}]}
+  const unreachable = [];
+  for (const { source, viewer } of stale) {
+    if (!bySource.has(source)) bySource.set(source, dijkstra(source, usable));
+    const path = pathTo(viewer, bySource.get(source));
+    if (!path || path.length === 0) { unreachable.push({ source, viewer }); continue; }
+    for (const e of path) {
+      const key = `${e.from}:${e.sucker}`;
+      if (!chosen.has(key)) chosen.set(key, { edge: e, pairs: [] });
+      chosen.get(key).pairs.push({ source, viewer });
+    }
+  }
+  return { chosen, unreachable };
+}
+
+function hubPaths({ usable, stale, hub }) {
+  const chosen = new Map();
+  const unreachable = [];
+  const fromHub = dijkstra(hub, usable);
+  const toHub = new Map(); // source -> dijkstra from source (for the inbound leg)
+  for (const { source, viewer } of stale) {
+    if (!toHub.has(source)) toHub.set(source, dijkstra(source, usable));
+    const inbound = source === hub ? [] : pathTo(hub, toHub.get(source));
+    const outbound = viewer === hub ? [] : pathTo(viewer, fromHub);
+    if (inbound === null || outbound === null) { unreachable.push({ source, viewer }); continue; }
+    for (const e of [...inbound, ...outbound]) {
+      const key = `${e.from}:${e.sucker}`;
+      if (!chosen.has(key)) chosen.set(key, { edge: e, pairs: [] });
+      chosen.get(key).pairs.push({ source, viewer });
+    }
+  }
+  return { chosen, unreachable };
+}
+
+function totalCost(chosen) {
+  return [...chosen.values()].reduce((s, { edge }) => s + edge.cost, 0n);
+}
+
 // edges:      [{from, to, sucker, cost: bigint, value: bigint, usable: bool}]
+//             cost should include transport value AND origin-chain execution
+//             gas, so expensive chains (mainnet) are naturally avoided.
 // stale:      [{source, viewer}]
 // pctOf:      (source, viewer) -> divergence percent (0 when source === viewer)
 // threshold:  percent above which a view counts as stale
 export function plan({ edges, stale, pctOf, threshold }) {
   const usable = edges.filter((e) => e.usable);
-  const bySource = new Map();
-  const readyEdges = new Map(); // dedupe by physical call site
-  const unreachable = [];
-  const waiting = [];
+  const nodes = new Set();
+  for (const e of usable) { nodes.add(e.from); nodes.add(e.to); }
 
+  // Candidate shapes: per-pair shortest paths, and consolidation through each
+  // possible hub. Cheapest total (unique edges) wins.
+  let best = pairPaths({ usable, stale });
+  for (const hub of nodes) {
+    const alt = hubPaths({ usable, stale, hub });
+    if (alt.unreachable.length > best.unreachable.length) continue;
+    if (alt.unreachable.length < best.unreachable.length || totalCost(alt.chosen) < totalCost(best.chosen)) {
+      best = alt;
+    }
+  }
+
+  // Round-based readiness: only fire edges whose sender already holds data
+  // within threshold of the source's truth while the receiver doesn't.
   const holdsGoodData = (chain, source) => chain === source || pctOf(source, chain) < threshold;
-
-  for (const { source, viewer } of stale) {
-    if (!bySource.has(source)) bySource.set(source, dijkstra(source, usable));
-    const path = pathTo(viewer, bySource.get(source));
-    if (!path || path.length === 0) { unreachable.push({ source, viewer }); continue; }
-
-    let anyReady = false;
-    for (const e of path) {
-      if (holdsGoodData(e.from, source) && !holdsGoodData(e.to, source)) {
-        readyEdges.set(`${e.from}:${e.sucker}`, e);
-        anyReady = true;
+  const readyEdges = new Map();
+  const servedPairs = new Set();
+  for (const { edge, pairs } of best.chosen.values()) {
+    for (const { source, viewer } of pairs) {
+      if (holdsGoodData(edge.from, source) && !holdsGoodData(edge.to, source)) {
+        readyEdges.set(`${edge.from}:${edge.sucker}`, edge);
+        servedPairs.add(`${source}:${viewer}`);
       }
     }
-    if (!anyReady) waiting.push({ source, viewer });
   }
+  const waiting = stale.filter(({ source, viewer }) =>
+    !servedPairs.has(`${source}:${viewer}`)
+    && !best.unreachable.some((u) => u.source === source && u.viewer === viewer));
 
   const chosen = [...readyEdges.values()];
   const totalValue = chosen.reduce((s, e) => s + e.value, 0n);
-  return { edges: chosen, totalValue, unreachable, waiting };
+  return { edges: chosen, totalValue, unreachable: best.unreachable, waiting };
 }

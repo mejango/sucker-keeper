@@ -52,6 +52,23 @@ test('parallel edges: cheaper one wins', () => {
   assert.deepEqual(p.edges.map((e) => e.sucker), ['cheap']);
 });
 
+test('hub consolidation: one shared edge into an expensive chain beats per-pair directs', () => {
+  // Chains 2, 3, 4 all need their records on chain 1 (think: Ethereum L1).
+  // Direct L2->L1 edges cost 100 each; the L2 mesh costs 1 per hop. Routing
+  // through hub 3 uses ONE edge into chain 1 instead of three.
+  const edges = [
+    E(2, 1, 100n), E(3, 1, 100n), E(4, 1, 100n),
+    E(2, 3, 1n), E(3, 2, 1n), E(2, 4, 1n), E(4, 2, 1n), E(3, 4, 1n), E(4, 3, 1n),
+  ];
+  const stale = [{ source: 2, viewer: 1 }, { source: 3, viewer: 1 }, { source: 4, viewer: 1 }];
+  const p = plan({ edges, stale, pctOf: () => 50, threshold: 1 });
+  const intoL1 = p.edges.filter((e) => e.to === 1);
+  assert.equal(intoL1.length, 1, `expected a single edge into chain 1, got ${intoL1.map((e) => `${e.from}>1`)}`);
+  // Round 1 fires the inbound consolidation legs plus the hub's own record
+  // heading to L1; the other records follow through the hub on later rounds.
+  assert.ok(p.edges.every((e) => e.to === 1 ? e.from === intoL1[0].from : e.to === intoL1[0].from));
+});
+
 test('totalValue sums transport payments of chosen edges', () => {
   const e1 = { ...E(1, 2), value: 100n };
   const e2 = { ...E(1, 3), value: 40n };

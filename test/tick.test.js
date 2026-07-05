@@ -96,34 +96,46 @@ const mkWalk = (sucker) => ({
 });
 
 let groupId;
+let sponsorshipId;
+const SPONSOR = '0xabc0000000000000000000000000000000000001';
 
 before(() => {
   db.init(join(mkdtempSync(join(tmpdir(), 'keeper-tick-')), 'tick.db'));
-  groupId = db.createGroup({ groupKey: '84532:9', thresholdPct: 1, registrant: '0xabc0000000000000000000000000000000000001', networkClass: 'testnet', members: MEMBERS });
+  groupId = db.createGroup({ groupKey: '84532:9', thresholdPct: 1, registrant: SPONSOR, networkClass: 'testnet', members: MEMBERS });
+  sponsorshipId = db.createSponsorship({ groupId, sponsor: SPONSOR, thresholdPct: 1 });
   fx.walk = mkWalk('0xs1');
 });
 
-test('in-sync group: no submission, underfunded recovers to active', async () => {
+test('no funded sponsor: scan early-outs without touching a single RPC', async () => {
+  const r = await scanGroup(db.groupById(groupId)); // sponsorship balance is 0
+  assert.equal(r.unfunded, true);
+  assert.equal(fx.submitted.length, 0);
+});
+
+test('in-sync group: no submission', async () => {
+  db.adjustSponsorBalance(sponsorshipId, 10n ** 18n);
   fx.snapshots = agreeingSnapshots();
-  db.setStatus(groupId, 'underfunded');
   const r = await scanGroup(db.groupById(groupId));
   assert.equal(r.inSync, true);
   assert.equal(fx.submitted.length, 0);
-  assert.equal(db.groupById(groupId).status, 'active');
 });
 
-test('stale + unaffordable: bundle quoted but NOT paid, group marked underfunded', async () => {
+test('stale + unaffordable: bundle quoted but NOT paid, sponsor marked underfunded', async () => {
+  const poor = db.createGroup({ groupKey: '84532:99', thresholdPct: 1, registrant: '0xpoor', networkClass: 'testnet', members: [{ chainId: 11155111, projectId: '99' }, { chainId: 84532, projectId: '98' }] });
+  const poorSponsorship = db.createSponsorship({ groupId: poor, sponsor: '0xpoor', thresholdPct: 1 });
+  db.adjustSponsorBalance(poorSponsorship, 1n); // dust: funded, can't pay
+  fx.walk = { ...mkWalk('0xpoor-edge'), members: db.membersOf(poor) };
   fx.snapshots = divergedSnapshots();
-  const r = await scanGroup(db.groupById(groupId)); // balance is 0
+  const r = await scanGroup(db.groupById(poor));
   assert.equal(r.underfunded, true);
   assert.equal(fx.submitted.length, 1); // quote fetched
   assert.equal(fx.payments.length, 0); // but nothing paid
-  assert.equal(db.groupById(groupId).status, 'underfunded');
-  assert.equal(db.groupById(groupId).balance_wei, '0'); // nothing debited
+  assert.equal(db.sponsorshipsOf(poor)[0].status, 'underfunded');
+  assert.equal(db.sponsorshipsOf(poor)[0].balance_wei, '1'); // nothing debited
+  fx.walk = mkWalk('0xs1');
 });
 
-test('stale + funded: pays, debits quote + gas allowance, records the sync', async () => {
-  db.adjustBalance(groupId, 10n ** 18n);
+test('stale + funded: pays, debits the sponsor quote + gas allowance, records the sync', async () => {
   fx.snapshots = divergedSnapshots();
   const r = await scanGroup(db.groupById(groupId));
 
@@ -141,10 +153,32 @@ test('stale + funded: pays, debits quote + gas allowance, records the sync', asy
   assert.equal(fx.payments[0].klass, 'testnet'); // payment restricted to the group's network class
 
   const expectedDebit = 10n ** 15n + 150_000n * GWEI; // payment amount + gas allowance
-  assert.equal(db.groupById(groupId).balance_wei, (10n ** 18n - expectedDebit).toString());
+  assert.equal(db.sponsorshipsOf(groupId)[0].balance_wei, (10n ** 18n - expectedDebit).toString());
   const sync = db.syncsOf(groupId)[0];
   assert.equal(sync.state, 'submitted');
-  assert.equal(JSON.parse(sync.plan_json).payment.hash, '0xpayhash');
+  const planData = JSON.parse(sync.plan_json);
+  assert.equal(planData.payment.hash, '0xpayhash');
+  assert.equal(planData.payers.length, 1);
+  assert.equal(planData.payers[0].shareWei, expectedDebit.toString());
+});
+
+test('costs split evenly among sponsors whose thresholds triggered', async () => {
+  const duo = db.createGroup({ groupKey: '84532:88', thresholdPct: 1, registrant: '0xd1', networkClass: 'testnet', members: [{ chainId: 11155111, projectId: '88' }, { chainId: 84532, projectId: '87' }] });
+  const s1 = db.createSponsorship({ groupId: duo, sponsor: '0xd1', thresholdPct: 1 });
+  const s2 = db.createSponsorship({ groupId: duo, sponsor: '0xd2', thresholdPct: 5 });
+  db.createSponsorship({ groupId: duo, sponsor: '0xd3', thresholdPct: 2 }); // unfunded: pays nothing
+  db.adjustSponsorBalance(s1, 10n ** 18n);
+  db.adjustSponsorBalance(s2, 10n ** 18n);
+  fx.walk = { ...mkWalk('0xduo-edge'), members: db.membersOf(duo) };
+  fx.snapshots = divergedSnapshots();
+  const r = await scanGroup(db.groupById(duo));
+  assert.ok(r.submitted);
+  const debit = 10n ** 15n + 150_000n * GWEI;
+  const half = debit / 2n;
+  assert.equal(db.sponsorshipsOf(duo).find((s) => s.sponsor_address === '0xd1').balance_wei, (10n ** 18n - (debit - half)).toString());
+  assert.equal(db.sponsorshipsOf(duo).find((s) => s.sponsor_address === '0xd2').balance_wei, (10n ** 18n - half).toString());
+  assert.equal(db.sponsorshipsOf(duo).find((s) => s.sponsor_address === '0xd3').balance_wei, '0');
+  fx.walk = mkWalk('0xs1');
 });
 
 test('an edge synced recently is NOT re-paid while its bridge message is in flight', async () => {
@@ -172,10 +206,10 @@ test('mesh growth refreshes members and migrates the group key', async () => {
   fx.walk = { ...fx.walk, members: MEMBERS };
 });
 
-test('finalizePending: success bundle reconciles to payment amount + actual gas', async () => {
+test('finalizePending: success bundle reconciles each payer to actual cost', async () => {
   const pending = db.pendingSyncs().find((s) => s.group_id === groupId);
   assert.ok(pending, 'previous test left a pending sync');
-  const balanceBefore = BigInt(db.groupById(groupId).balance_wei);
+  const balanceBefore = BigInt(db.sponsorshipsOf(groupId)[0].balance_wei);
 
   fx.bundle = { transactions: [{ status: { state: 'Success', data: { hash: '0xdest' } } }] };
   fx.receipt = { gasUsed: 80_000n, effectiveGasPrice: GWEI };
@@ -185,8 +219,8 @@ test('finalizePending: success bundle reconciles to payment amount + actual gas'
   assert.equal(row.state, 'success');
   const actual = 10n ** 15n + 80_000n * GWEI;
   assert.equal(row.final_cost_wei, actual.toString());
-  // Refund = quoted - actual = (150k - 80k) * gwei
-  assert.equal(BigInt(db.groupById(groupId).balance_wei), balanceBefore + 70_000n * GWEI);
+  // Refund = quoted - actual = (150k - 80k) * gwei, back to the payer
+  assert.equal(BigInt(db.sponsorshipsOf(groupId)[0].balance_wei), balanceBefore + 70_000n * GWEI);
 });
 
 test('finalizePending: failed tx marks the sync failed but still bills the payment', async () => {
@@ -257,12 +291,11 @@ test('non-simulation relayr failures still abort the scan for that group', async
 });
 
 test('payment failure surfaces as a scan error and nothing is debited', async () => {
-  db.setStatus(groupId, 'active');
   fx.walk = mkWalk('0xf4');
-  const balanceBefore = db.groupById(groupId).balance_wei;
+  const balanceBefore = db.sponsorshipsOf(groupId)[0].balance_wei;
   fx.snapshots = divergedSnapshots();
   fx.payThrows = new Error('keeper wallet cannot cover the relayr payment on any chain');
   await assert.rejects(() => scanGroup(db.groupById(groupId)), /cannot cover/);
-  assert.equal(db.groupById(groupId).balance_wei, balanceBefore);
+  assert.equal(db.sponsorshipsOf(groupId)[0].balance_wei, balanceBefore);
   fx.payThrows = null;
 });
