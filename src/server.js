@@ -8,6 +8,7 @@ import { isSupported, networkClass } from './chains.js';
 import { walkGroup, snapshotGroup, groupKeyOf } from './mesh.js';
 import { divergenceMatrix } from './monitor.js';
 import { claimDeposit, httpError } from './deposits.js';
+import { ensureGroup } from './groups.js';
 import { keeperAddress, walletBalances } from './wallet.js';
 import { projectLabel } from './bendystraw.js';
 import { scanAll, finalizePending } from './tick.js';
@@ -64,27 +65,7 @@ async function registerProject(body) {
   if (!isAddress(sponsor || '')) throw httpError(400, 'sponsor must be an address');
   if (!(thresholdPct > 0 && thresholdPct <= 100)) throw httpError(400, 'thresholdPct must be in (0, 100]');
 
-  let group = db.groupByMember(chainId, projectId);
-  if (!group) {
-    const walk = await walkGroup(chainId, projectId);
-    if (walk.members.length < 2 || walk.edges.length === 0) {
-      throw httpError(422, 'project has no sucker group on supported chains — nothing to keep in sync');
-    }
-    const classes = new Set(walk.members.map((m) => networkClass(m.chainId)));
-    if (classes.size > 1) throw httpError(422, 'group spans mainnet and testnet chains');
-    for (const m of walk.members) {
-      const existing = db.groupByMember(m.chainId, m.projectId);
-      if (existing) { group = existing; break; }
-    }
-    if (!group) {
-      const id = db.createGroup({
-        groupKey: groupKeyOf(walk.members), thresholdPct, registrant: sponsor,
-        networkClass: [...classes][0], members: walk.members,
-      });
-      group = db.groupById(id);
-    }
-  }
-
+  const group = await ensureGroup(chainId, projectId, sponsor);
   if (db.sponsorshipOf(group.id, sponsor)) throw httpError(409, 'this address already sponsors the project — fund it or update its threshold');
   db.createSponsorship({ groupId: group.id, sponsor, thresholdPct });
   return groupView(db.groupById(group.id));
@@ -124,7 +105,8 @@ async function handle(req, res) {
 
   if (req.method === 'GET' && url.pathname === '/activity') {
     const limit = Math.min(Number(url.searchParams.get('limit') || 20), 100);
-    const rows = db.recentActivity(limit);
+    const offset = Math.max(Number(url.searchParams.get('offset') || 0), 0);
+    const rows = db.recentActivity(limit, offset);
     const labels = new Map(); // group_id -> label (best-effort, from the group's anchor member)
     await Promise.all([...new Set(rows.map((r) => r.group_id))].map(async (gid) => {
       const m = db.membersOf(gid)[0];
@@ -154,8 +136,10 @@ async function handle(req, res) {
       chainId: Number(body.depositChainId ?? body.chainId),
       projectChainId: Number(body.projectChainId ?? body.chainId),
       projectId: String(body.projectId),
+      thresholdPct: body.thresholdPct,
       expiresAt: Number(body.expiresAt),
       signature: body.signature,
+      ensureGroup: (c, p) => ensureGroup(c, p, null),
     });
     if (!result.pending) {
       result.label = await projectLabel(Number(body.projectChainId ?? body.chainId), String(body.projectId));

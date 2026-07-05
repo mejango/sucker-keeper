@@ -56,11 +56,6 @@ ul { list-style: none; } li { margin: 2px 0; font-size: 13px; }
 
 <main>
 
-<section>
-  <h2>Recent activity</h2>
-  <div class="out" id="activity"><span class="hint">loading…</span></div>
-</section>
-
 <section id="lookup-section">
   <h2>Monitor</h2>
   <div class="row">
@@ -73,33 +68,19 @@ ul { list-style: none; } li { margin: 2px 0; font-size: 13px; }
 </section>
 
 <section>
-  <h2>Register</h2>
-  <p class="hint">Any address can sponsor any project with suckers, by any of its per-chain IDs — your own threshold, your own balance, without affecting other sponsors of the same project. Registration is free — the keeper only syncs funded projects.</p>
-  <div class="row">
-    <div><label>chain</label><select id="rg-chain"></select></div>
-    <div><label>project id (on that chain)</label><input id="rg-project" placeholder="e.g. 5"></div>
-  </div>
-  <div class="row">
-    <div><label>sponsor address (owns this threshold + balance)</label><input id="rg-registrant" placeholder="0x… — [use wallet] fills this"></div>
-    <div><label>sync threshold % (views off by this much trigger a sync)</label><input id="rg-threshold" value="1"></div>
-  </div>
-  <button id="rg-wallet">use wallet</button>
-  <button id="rg-btn">register</button>
-  <div class="out" id="rg-out"></div>
-</section>
-
-<section>
-  <h2>Fund</h2>
-  <p class="hint">Send ETH to the keeper's wallet <span class="mono" id="fund-address">…</span> on any supported chain (mainnet groups need mainnet ETH), then claim the tx hash for your project. Claims must be <b>signed by the sending wallet</b> (nobody can claim your deposit), and credits land on your own sponsorship. Direct transfers only — contract-internal sends won't verify, and the sender must be able to sign (no exchange withdrawals).</p>
+  <h2>Sponsor &amp; fund</h2>
+  <p class="hint">Any address can sponsor any project with suckers, by any of its per-chain IDs — your own threshold, your own balance, without affecting other sponsors of the same project. One flow: send ETH to the keeper's wallet <span class="mono" id="fund-address">…</span> and sign the claim; the project registers automatically if it's new. Claims must be <b>signed by the sending wallet</b> (nobody can claim your deposit) — direct transfers only, and the sender must be able to sign (no exchange withdrawals).</p>
   <div class="row">
     <div><label>project chain</label><select id="fd-pchain"></select></div>
-    <div><label>project id</label><input id="fd-project" placeholder="e.g. 5"></div>
+    <div><label>project id (on that chain)</label><input id="fd-project" placeholder="e.g. 5"></div>
+    <div><label>your sync threshold %</label><input id="fd-threshold" value="1"></div>
   </div>
   <div class="row">
     <div><label>deposit chain</label><select id="fd-chain"></select></div>
-    <div><label>amount (ETH) — for wallet send</label><input id="fd-amount" value="0.05"></div>
+    <div><label>amount (ETH)</label><input id="fd-amount" value="0.05"></div>
   </div>
-  <button id="fd-send">send with wallet + claim</button>
+  <button id="fd-send">sponsor: send with wallet + claim</button>
+  <button id="rg-btn">register only (no funding)</button>
   <div class="row">
     <div><label>…or claim an already-sent tx hash</label><input id="fd-hash" placeholder="0x…"></div>
   </div>
@@ -117,6 +98,12 @@ ul { list-style: none; } li { margin: 2px 0; font-size: 13px; }
   </div>
   <button id="th-btn">sign &amp; update</button>
   <div class="out" id="th-out"></div>
+</section>
+
+<section>
+  <h2>Recent activity</h2>
+  <div class="out" id="activity"><span class="hint">loading…</span></div>
+  <div id="activity-sentinel"></div>
 </section>
 
 </main>
@@ -159,7 +146,7 @@ var CHAIN_GROUPS = [
   ['mainnets', [1, 10, 8453, 42161]],
   ['testnets', [11155111, 11155420, 84532, 421614]],
 ];
-['lk-chain', 'rg-chain', 'fd-pchain', 'fd-chain', 'th-chain'].forEach(function (id) {
+['lk-chain', 'fd-pchain', 'fd-chain', 'th-chain'].forEach(function (id) {
   var sel = $(id);
   CHAIN_GROUPS.forEach(function (g) {
     var grp = document.createElement('optgroup'); grp.label = g[0];
@@ -184,32 +171,56 @@ function groupRef(a) {
   var esc = function (s) { return String(s).replace(/[<>&"]/g, function (c) { return { '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]; }); };
   return a.label ? '<b>' + esc(a.label) + '</b> <span class="hint">(' + esc(a.groupKey) + ')</span>' : '<b>' + esc(a.groupKey) + '</b>';
 }
-function loadActivity() {
-  api('GET', '/activity?limit=15').then(function (d) {
-    if (!d.activity.length) {
-      $('activity').innerHTML = '<span class="hint">nothing yet — register a project below to be the first.</span>';
-      return;
-    }
-    var html = '<ul>';
-    d.activity.forEach(function (a) {
-      var when = new Date(a.at * 1000).toLocaleString();
-      var line;
-      if (a.type === 'sync') {
-        line = (a.detail === 'failed' ? 'sync failed for ' : a.detail === 'submitted' ? 'syncing ' : 'synced ') + groupRef(a) +
-          (a.edges ? ': ' + a.edges.map(function (e) { return chainName(e.from) + '→' + chainName(e.to); }).join(', ') : '') +
-          (a.amountWei ? ' — ' + fmtEth(a.amountWei) : '');
-      } else if (a.type === 'deposit') {
-        line = groupRef(a) + ' funded with ' + fmtEth(a.amountWei);
-      } else {
-        line = groupRef(a) + ' registered';
-      }
-      html += '<li><span class="hint">' + when + '</span> — ' + line + '</li>';
-    });
-    $('activity').innerHTML = html + '</ul>';
-  }).catch(function (e) { $('activity').innerHTML = '<span class="hint">activity unavailable: ' + e.message + '</span>'; });
+var actState = { items: [], offset: 0, exhausted: false, loading: false, pageSize: 20 };
+function renderActivityLine(a) {
+  var when = new Date(a.at * 1000).toLocaleString();
+  var line;
+  if (a.type === 'sync') {
+    line = (a.detail === 'failed' ? 'sync failed for ' : a.detail === 'submitted' ? 'syncing ' : 'synced ') + groupRef(a) +
+      (a.edges ? ': ' + a.edges.map(function (e) { return chainName(e.from) + '→' + chainName(e.to); }).join(', ') : '') +
+      (a.amountWei ? ' — ' + fmtEth(a.amountWei) : '');
+  } else if (a.type === 'deposit') {
+    line = groupRef(a) + ' funded with ' + fmtEth(a.amountWei);
+  } else {
+    line = groupRef(a) + ' registered';
+  }
+  return '<li><span class="hint">' + when + '</span> — ' + line + '</li>';
 }
-loadActivity();
-setInterval(loadActivity, 60000);
+function renderActivity() {
+  if (!actState.items.length) {
+    $('activity').innerHTML = '<span class="hint">nothing yet — register a project above to be the first.</span>';
+    return;
+  }
+  $('activity').innerHTML = '<ul>' + actState.items.map(renderActivityLine).join('') + '</ul>' +
+    (actState.exhausted ? '<div class="hint">that\'s everything.</div>' : '');
+}
+function loadMoreActivity() {
+  if (actState.loading || actState.exhausted) return;
+  actState.loading = true;
+  api('GET', '/activity?limit=' + actState.pageSize + '&offset=' + actState.offset).then(function (d) {
+    actState.items = actState.items.concat(d.activity);
+    actState.offset += d.activity.length;
+    if (d.activity.length < actState.pageSize) actState.exhausted = true;
+    renderActivity();
+  }).catch(function (e) {
+    if (!actState.items.length) $('activity').innerHTML = '<span class="hint">activity unavailable: ' + e.message + '</span>';
+  }).finally(function () { actState.loading = false; });
+}
+loadMoreActivity();
+new IntersectionObserver(function (entries) {
+  if (entries[0].isIntersecting) loadMoreActivity();
+}).observe($('activity-sentinel'));
+// Keep the first page fresh, but never yank the list out from under someone
+// who has scrolled deeper.
+setInterval(function () {
+  if (actState.offset > actState.pageSize) return;
+  api('GET', '/activity?limit=' + actState.pageSize).then(function (d) {
+    actState.items = d.activity;
+    actState.offset = d.activity.length;
+    actState.exhausted = d.activity.length < actState.pageSize;
+    renderActivity();
+  }).catch(function () {});
+}, 60000);
 
 // ---- monitor ----
 function renderGroup(g) {
@@ -271,30 +282,27 @@ $('lk-btn').onclick = async function () {
   } catch (e) { out('lk-out', e.message, true); }
 };
 
-// ---- register ----
-$('rg-wallet').onclick = async function () {
-  try { $('rg-registrant').value = await walletAccount(); } catch (e) { out('rg-out', e.message, true); }
-};
+// ---- register only (no funding) ----
 $('rg-btn').onclick = async function () {
-  out('rg-out', 'walking the sucker mesh across chains…');
+  out('fd-out', 'walking the sucker mesh across chains…');
   try {
     var g = await api('POST', '/projects', {
-      chainId: Number($('rg-chain').value),
-      projectId: $('rg-project').value.trim(),
-      sponsor: $('rg-registrant').value.trim(),
-      thresholdPct: Number($('rg-threshold').value),
+      chainId: Number($('fd-pchain').value),
+      projectId: $('fd-project').value.trim(),
+      sponsor: await walletAccount(),
+      thresholdPct: Number($('fd-threshold').value) || 1,
     });
-    out('rg-out', 'sponsoring group ' + g.groupKey + ' (' + g.members.length + ' chains: ' +
+    out('fd-out', 'sponsoring group ' + g.groupKey + ' (' + g.members.length + ' chains: ' +
       g.members.map(function (m) { return chainName(m.chainId) + ':' + m.projectId; }).join(', ') + ')' +
-      '\nnow fund your sponsorship below so syncs can run.');
-  } catch (e) { out('rg-out', e.message, true); }
+      '\nfund your sponsorship to start syncs.');
+  } catch (e) { out('fd-out', e.message, true); }
 };
 
 // ---- fund ----
 async function signClaim(txHash, t) {
   var from = await walletAccount();
   var expiresAt = Math.floor(Date.now() / 1000) + 3600;
-  var message = 'keeper:claim:' + txHash.toLowerCase() + ':' + t.projectChainId + ':' + t.projectId + ':' + expiresAt;
+  var message = 'keeper:claim:' + txHash.toLowerCase() + ':' + t.projectChainId + ':' + t.projectId + ':' + t.thresholdPct + ':' + expiresAt;
   var hexMsg = '0x' + Array.from(new TextEncoder().encode(message)).map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
   var signature = await window.ethereum.request({ method: 'personal_sign', params: [hexMsg, from] });
   return { signature: signature, expiresAt: expiresAt };
@@ -306,6 +314,7 @@ function fundTarget() {
     depositChainId: Number($('fd-chain').value),
     projectChainId: Number($('fd-pchain').value),
     projectId: $('fd-project').value.trim(),
+    thresholdPct: Number($('fd-threshold').value) || 1,
   };
 }
 function fundedName(d, t) {
@@ -318,6 +327,7 @@ async function claim(txHash, t, sig) {
     depositChainId: t.depositChainId,
     projectChainId: t.projectChainId,
     projectId: t.projectId,
+    thresholdPct: t.thresholdPct,
     signature: sig.signature,
     expiresAt: sig.expiresAt,
   });

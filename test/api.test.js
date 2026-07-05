@@ -13,8 +13,8 @@ const KEEPER_PK = `0x${'33'.repeat(32)}`;
 const DEPOSIT_ADDRESS = privateKeyToAccount(KEEPER_PK).address.toLowerCase();
 const registrantAccount = privateKeyToAccount(`0x${'11'.repeat(32)}`);
 const depositorAccount = privateKeyToAccount(`0x${'55'.repeat(32)}`);
-const signClaim = (acct, { txHash, projectChainId, projectId, expiresAt }) =>
-  acct.signMessage({ message: `keeper:claim:${txHash.toLowerCase()}:${projectChainId}:${projectId}:${expiresAt}` });
+const signClaim = (acct, { txHash, projectChainId, projectId, thresholdPct = 1, expiresAt }) =>
+  acct.signMessage({ message: `keeper:claim:${txHash.toLowerCase()}:${projectChainId}:${projectId}:${thresholdPct}:${expiresAt}` });
 
 process.env.DB_PATH = join(mkdtempSync(join(tmpdir(), 'keeper-api-')), 'api.db');
 process.env.PORT = '0';
@@ -221,7 +221,36 @@ test('POST /deposits rejections: wrong recipient, reverted, unconfirmed, class m
 
   fx.receipt = { status: 'success', blockNumber: 100n }; fx.head = 105n;
   assert.equal((await claim('0xdd05', { depositChainId: 8453 })).status, 400); // mainnet ETH for a testnet group
-  assert.equal((await claim('0xdd06', { projectChainId: 1, projectId: '999' })).status, 404);
+
+  // Unknown project with no sucker group: auto-registration fails cleanly.
+  fx.walk = { members: [{ chainId: 1, projectId: '999' }], edges: [], unsupported: [] };
+  assert.equal((await claim('0xdd06', { projectChainId: 1, projectId: '999' })).status, 422);
+});
+
+test('funding an unregistered project auto-registers it with the signed threshold', async () => {
+  fx.walk = {
+    members: [{ chainId: 11155420, projectId: '77' }, { chainId: 421614, projectId: '78' }],
+    edges: [{ from: 11155420, to: 421614, sucker: '0xs9' }, { from: 421614, to: 11155420, sucker: '0xs9' }],
+    unsupported: [],
+  };
+  const value = 10n ** 17n;
+  fx.tx = { to: DEPOSIT_ADDRESS, from: depositorAccount.address, value };
+  fx.receipt = { status: 'success', blockNumber: 100n };
+  fx.head = 105n;
+  const expiresAt = Math.floor(Date.now() / 1000) + 3600;
+  const signature = await signClaim(depositorAccount, { txHash: '0xdd07', projectChainId: 11155420, projectId: '77', thresholdPct: 3, expiresAt });
+  const ok = await api('POST', '/deposits', {
+    txHash: '0xdd07', depositChainId: 84532, projectChainId: 11155420, projectId: '77',
+    thresholdPct: 3, expiresAt, signature,
+  });
+  assert.equal(ok.status, 201);
+  assert.equal(ok.body.groupKey, '421614:78');
+  assert.equal(ok.body.thresholdPct, 3);
+
+  const view = await api('GET', '/projects/421614/78');
+  assert.equal(view.status, 200); // registered without ever calling POST /projects
+  assert.equal(view.body.sponsorships[0].thresholdPct, 3);
+  assert.equal(view.body.sponsorships[0].balanceWei, value.toString());
 });
 
 test('GET /activity merges registrations, deposits, and syncs with labels, newest first', async () => {

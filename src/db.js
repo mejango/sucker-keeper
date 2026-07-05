@@ -233,7 +233,7 @@ export function recentSyncEdges(groupId, sinceSeconds) {
 
 // Merged service-wide feed for the landing page: syncs, deposits, and
 // registrations, newest first.
-export function recentActivity(limit = 20) {
+export function recentActivity(limit = 20, offset = 0) {
   return db.prepare(`
     SELECT * FROM (
       SELECT 'sync' AS type, s.created_at AS at, g.id AS group_id, g.group_key,
@@ -245,6 +245,6 @@ export function recentActivity(limit = 20) {
       UNION ALL
       SELECT 'register', g.created_at, g.id, g.group_key, g.registrant_address, NULL, NULL
         FROM groups g
-    ) ORDER BY at DESC LIMIT ?
-  `).all(limit);
+    ) ORDER BY at DESC LIMIT ? OFFSET ?
+  `).all(limit, offset);
 }

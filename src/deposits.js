@@ -14,16 +14,20 @@ import * as db from './db.js';
 
 export const DEFAULT_THRESHOLD_PCT = 1;
 
-export function claimMessage({ txHash, projectChainId, projectId, expiresAt }) {
-  return `keeper:claim:${txHash.toLowerCase()}:${projectChainId}:${projectId}:${expiresAt}`;
+// The threshold rides inside the signed message so a claim can't be replayed
+// with a different threshold than the depositor chose.
+export function claimMessage({ txHash, projectChainId, projectId, thresholdPct, expiresAt }) {
+  return `keeper:claim:${txHash.toLowerCase()}:${projectChainId}:${projectId}:${thresholdPct}:${expiresAt}`;
 }
 
-export async function claimDeposit({ txHash, chainId, projectChainId, projectId, expiresAt, signature }) {
+export async function claimDeposit({ txHash, chainId, projectChainId, projectId, thresholdPct, expiresAt, signature, ensureGroup }) {
   if (!isSupported(chainId)) throw httpError(400, `unsupported chain ${chainId}`);
   const depositAddress = keeperAddress();
-
-  const group = db.groupByMember(projectChainId, projectId);
-  if (!group) throw httpError(404, 'project not registered — register it first (free)');
+  thresholdPct = Number(thresholdPct ?? DEFAULT_THRESHOLD_PCT);
+  if (!(thresholdPct > 0 && thresholdPct <= 100)) throw httpError(400, 'thresholdPct must be in (0, 100]');
+  // Funding auto-registers: if nobody has registered this group yet, walking
+  // the mesh and creating it is free.
+  const group = await ensureGroup(projectChainId, projectId);
   if (networkClass(chainId) !== group.network_class) {
     throw httpError(400, `${group.network_class} group must be funded from a ${group.network_class} chain`);
   }
@@ -50,13 +54,13 @@ export async function claimDeposit({ txHash, chainId, projectChainId, projectId,
   if (head < receipt.blockNumber + 1n) return pending;
 
   // Only the sender may attribute their deposit.
-  const message = claimMessage({ txHash, projectChainId, projectId, expiresAt });
+  const message = claimMessage({ txHash, projectChainId, projectId, thresholdPct, expiresAt });
   const ok = await verifyMessage({ address: tx.from, message, signature }).catch(() => false);
   if (!ok) throw httpError(403, 'claim must be signed by the depositing address');
 
   let sponsorship = db.sponsorshipOf(group.id, tx.from);
   if (!sponsorship) {
-    db.createSponsorship({ groupId: group.id, sponsor: tx.from, thresholdPct: DEFAULT_THRESHOLD_PCT });
+    db.createSponsorship({ groupId: group.id, sponsor: tx.from, thresholdPct });
     sponsorship = db.sponsorshipOf(group.id, tx.from);
   }
   db.insertDeposit({ txHash, chainId, from: tx.from, amountWei: tx.value, groupId: group.id });
