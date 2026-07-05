@@ -131,12 +131,13 @@ async function handle(req, res) {
 
   if (req.method === 'POST' && url.pathname === '/deposits') {
     const body = await readBody(req);
-    return json(res, 201, await claimDeposit({
+    const result = await claimDeposit({
       txHash: body.txHash,
       chainId: Number(body.depositChainId ?? body.chainId),
       projectChainId: Number(body.projectChainId ?? body.chainId),
       projectId: String(body.projectId),
-    }));
+    });
+    return json(res, result.pending ? 202 : 201, result);
   }
 
   if (parts[0] === 'projects' && parts.length === 3) {

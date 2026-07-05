@@ -15,6 +15,7 @@ const fx = {
   quote: { usable: true, value: 0n, family: 'native' },
   paymentInfo: [{ chain: 84532, target: '0xrelayr', amount: (10n ** 15n).toString(), calldata: '0x', token: '0x0' }],
   submitted: [], // captured relayr submissions
+  submitErrors: [], // queued errors thrown by submitPrepaidBundle before succeeding
   payments: [], // captured wallet payments
   bundle: null, // getBundle fixture
   receipt: { gasUsed: 100_000n, effectiveGasPrice: GWEI },
@@ -46,6 +47,7 @@ mock.module(p('../src/quote.js'), {
 mock.module(p('../src/relayr.js'), {
   namedExports: {
     submitPrepaidBundle: async (txs) => {
+      if (fx.submitErrors.length) throw fx.submitErrors.shift();
       fx.submitted.push(txs);
       return { bundleUuid: `uuid-${fx.submitted.length}`, paymentInfo: fx.paymentInfo };
     },
@@ -190,6 +192,33 @@ test('finalizePending: unsettled fresh bundles are left alone', async () => {
   fx.bundle = { transactions: [{ status: { state: 'Pending' } }] };
   await finalizePending();
   assert.equal(db.syncsOf(groupId).find((s) => s.id === pending.id).state, 'submitted');
+});
+
+test('a SimulationReverted edge is dropped and the rest of the bundle resubmits', async () => {
+  db.setStatus(groupId, 'active');
+  // Both directions stale -> planner picks both edges.
+  fx.snapshots = new Map([
+    [11155111, { chainId: 11155111, truth: account(11155111, 1000n), beliefs: new Map() }],
+    [84532, { chainId: 84532, truth: account(84532, 500n), beliefs: new Map() }],
+  ]);
+  const simErr = Object.assign(new Error('relayr POST /v1/bundle/prepaid HTTP 406'), {
+    status: 406,
+    body: '{"SimulationReverted":{"transaction":{"chain":11155111,"target":"0xs1","data":"0x","value":"0x0","virtual_nonce":null},"trace":{}}}',
+  });
+  fx.submitErrors.push(simErr);
+  const r = await scanGroup(db.groupById(groupId));
+  assert.ok(r.submitted);
+  assert.equal(r.edges.length, 1); // survivor only
+  assert.equal(r.edges[0].from, 84532);
+  assert.equal(fx.submitted.at(-1).length, 1);
+  const plan = JSON.parse(db.syncsOf(groupId)[0].plan_json);
+  assert.deepEqual(plan.dropped, [{ chain: 11155111, target: '0xs1' }]);
+});
+
+test('non-simulation relayr failures still abort the scan for that group', async () => {
+  fx.snapshots = divergedSnapshots();
+  fx.submitErrors.push(Object.assign(new Error('relayr HTTP 500'), { status: 500, body: 'oops' }));
+  await assert.rejects(() => scanGroup(db.groupById(groupId)), /HTTP 500/);
 });
 
 test('payment failure surfaces as a scan error and nothing is debited', async () => {

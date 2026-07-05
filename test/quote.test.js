@@ -46,13 +46,21 @@ test('CCIP edge INTO an L1 stays usable (CCIP self-delivers)', async () => {
   assert.equal(q.family, 'ccip');
 });
 
-test('binary search lands within ~7% above the true fee (tight quote, small pad)', async () => {
+test('CCIP quote = fee + ~20% drift pad', async () => {
   const FEE = 314_159_265_358_979n; // arbitrary ~3e14
   fx.set('0xccip', { ccip: true, accepts: (v) => v >= FEE });
   const q = await quoteEdge({ from: 8453, to: 42161, sucker: '0xccip' });
   assert.equal(q.usable, true);
-  assert.ok(q.value >= FEE, `quote ${q.value} below fee ${FEE}`);
-  assert.ok(q.value <= (FEE * 107n) / 100n, `quote ${q.value} overshoots fee ${FEE}`);
+  assert.ok(q.value >= (FEE * 119n) / 100n, `quote ${q.value} pads less than 20% over ${FEE}`);
+  assert.ok(q.value <= (FEE * 123n) / 100n, `quote ${q.value} overshoots fee ${FEE}`);
+});
+
+test('Arb retryable (native L1->L2 with fee) gets a 2x pad — submission cost tracks basefee', async () => {
+  const FEE = 6_408_691_406_250n;
+  fx.set('0xarb', { ccip: false, accepts: (v) => v >= FEE });
+  const q = await quoteEdge({ from: 1, to: 42161, sucker: '0xarb' });
+  assert.equal(q.usable, true);
+  assert.ok(q.value >= (FEE * 199n) / 100n && q.value <= (FEE * 205n) / 100n, `quote ${q.value} not ~2x ${FEE}`);
 });
 
 test('sucker that reverts at any value (deprecated/paused) is unusable', async () => {

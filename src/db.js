@@ -129,7 +129,7 @@ export function pendingSyncs() {
 }
 
 export function syncsOf(groupId, limit = 20) {
-  return db.prepare('SELECT * FROM syncs WHERE group_id = ? ORDER BY created_at DESC LIMIT ?').all(Number(groupId), limit);
+  return db.prepare('SELECT * FROM syncs WHERE group_id = ? ORDER BY created_at DESC, id DESC LIMIT ?').all(Number(groupId), limit);
 }
 
 // Merged service-wide feed for the landing page: syncs, deposits, and

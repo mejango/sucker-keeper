@@ -22,6 +22,7 @@ export async function claimDeposit({ txHash, chainId, projectChainId, projectId 
 
   const client = clientFor(chainId);
   let tx, receipt, head;
+  const pending = { pending: true, message: 'tx not confirmed yet — it will be creditable once mined' };
   try {
     [tx, receipt, head] = await Promise.all([
       client.getTransaction({ hash: txHash }),
@@ -29,16 +30,14 @@ export async function claimDeposit({ txHash, chainId, projectChainId, projectId 
       client.getBlockNumber(),
     ]);
   } catch (err) {
-    // Expected while the tx is still pending — the UI polls and retries.
-    if (/could not be found|not be processed/i.test(err.message || '')) {
-      throw httpError(404, 'tx not yet confirmed on the claimed chain — retry shortly');
-    }
+    // Not an error — the tx just hasn't been mined yet. Callers poll.
+    if (/could not be found|not be processed/i.test(err.message || '')) return pending;
     throw err;
   }
   if (receipt.status !== 'success') throw httpError(400, 'tx reverted');
   if (tx.to?.toLowerCase() !== depositAddress) throw httpError(400, 'tx is not a transfer to the deposit address');
   if (tx.value === 0n) throw httpError(400, 'tx carries no value');
-  if (head < receipt.blockNumber + 1n) throw httpError(400, 'tx not yet confirmed');
+  if (head < receipt.blockNumber + 1n) return pending;
 
   db.insertDeposit({ txHash, chainId, from: tx.from, amountWei: tx.value, groupId: group.id });
   const balance = db.adjustBalance(group.id, tx.value);

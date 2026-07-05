@@ -39,7 +39,10 @@ mock.module(p('../src/chains.js'), {
     ...actualChains,
     clientFor: () => ({
       getTransaction: async () => fx.tx,
-      getTransactionReceipt: async () => fx.receipt,
+      getTransactionReceipt: async () => {
+        if (!fx.receipt) throw new Error('Transaction receipt with hash "0x…" could not be found. The Transaction may not be processed on a block yet.');
+        return fx.receipt;
+      },
       getBlockNumber: async () => fx.head,
     }),
   },
@@ -175,8 +178,16 @@ test('POST /deposits rejections: wrong recipient, reverted, unconfirmed, class m
   fx.receipt = { status: 'reverted', blockNumber: 100n };
   assert.equal((await claim('0xdd03')).status, 400);
 
-  fx.receipt = { status: 'success', blockNumber: 105n }; fx.head = 105n; // 0 confs
-  assert.equal((await claim('0xdd04')).status, 400);
+  // Pending states are 202 "not yet", not errors: 0 confirmations…
+  fx.receipt = { status: 'success', blockNumber: 105n }; fx.head = 105n;
+  const zeroConf = await claim('0xdd04');
+  assert.equal(zeroConf.status, 202);
+  assert.equal(zeroConf.body.pending, true);
+  // …and a receipt the RPC can't find yet.
+  fx.receipt = null;
+  const unmined = await claim('0xdd04b');
+  assert.equal(unmined.status, 202);
+  assert.equal(unmined.body.pending, true);
 
   fx.receipt = { status: 'success', blockNumber: 100n }; fx.head = 105n;
   assert.equal((await claim('0xdd05', { depositChainId: 8453 })).status, 400); // mainnet ETH for a testnet group

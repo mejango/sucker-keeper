@@ -62,15 +62,23 @@ export async function quoteEdge({ from, to, sucker }) {
   if (!(await probe(from, sucker, PROBE_MAX))) {
     return { usable: false, family, reason: 'sync-reverts-at-any-value' };
   }
-  // Binary-search the minimal accepted value, then pad 5% for fee drift
-  // between quote and execution. On CCIP the pad is refunded (to the relayer);
-  // underquoting reverts and simply retries next tick.
+  // Binary-search the minimal accepted value, then pad for fee drift between
+  // our probe and Relayr's later simulation/execution — CCIP's getFee and
+  // Arbitrum's retryable submission cost both track gas prices, and an
+  // underquoted tx gets the whole bundle rejected (406 SimulationReverted).
+  // Arb retryables are the most volatile (submission cost scales with L1
+  // basefee), so native nonzero fees get 2x; CCIP gets 20%. The pads are
+  // small certain overpayments (refunded to Relayr's relayer / the L2 refund
+  // address) that buy bundle reliability.
   let lo = 0n; // known-failing
   let hi = PROBE_MAX; // known-passing
-  for (let i = 0; i < 14; i++) {
+  // Iterate to ~2% relative precision — a fixed iteration count leaves the
+  // result dominated by search granularity when the true fee is small.
+  for (let i = 0; i < 30 && hi - lo > hi / 50n + 1n; i++) {
     const mid = (lo + hi) / 2n;
     if (await probe(from, sucker, mid)) hi = mid;
     else lo = mid;
   }
-  return { usable: true, family, value: (hi * 105n) / 100n };
+  const padPct = family === 'ccip' ? 120n : 200n;
+  return { usable: true, family, value: (hi * padPct) / 100n };
 }

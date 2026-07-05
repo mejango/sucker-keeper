@@ -19,6 +19,33 @@ const HOP_PENALTY = 10n ** 13n;
 const PAYMENT_GAS_ALLOWANCE = 150_000n;
 const SYNC_TIMEOUT_S = 24 * 3600;
 
+// Relayr simulates every tx before quoting and 406s the WHOLE bundle if any
+// one reverts (e.g. a bridge fee that drifted past its pad). Rather than lose
+// the round, drop the offending edge and resubmit the rest — the dropped edge
+// re-quotes fresh on the next scan.
+function parseSimulationRevertedTx(err) {
+  if (err?.status !== 406) return null;
+  const m = /"SimulationReverted".*?"chain"\s*:\s*(\d+)\s*,\s*"target"\s*:\s*"([^"]+)"/s.exec(err.body || '');
+  return m ? { chain: Number(m[1]), target: m[2].toLowerCase() } : null;
+}
+
+async function submitDroppingRevertedEdges(txs) {
+  const dropped = [];
+  let remaining = txs;
+  for (let attempt = 0; attempt < 6 && remaining.length; attempt++) {
+    try {
+      const res = await submitPrepaidBundle(remaining);
+      return { ...res, submittedTxs: remaining, dropped };
+    } catch (err) {
+      const failing = parseSimulationRevertedTx(err);
+      if (!failing) throw err;
+      dropped.push(failing);
+      remaining = remaining.filter((t) => !(Number(t.chain) === failing.chain && t.target.toLowerCase() === failing.target));
+    }
+  }
+  throw new Error(`relayr simulation rejected the bundle even after dropping ${dropped.length} edge(s)`);
+}
+
 export async function scanGroup(group) {
   const stored = db.membersOf(group.id);
 
@@ -57,7 +84,9 @@ export async function scanGroup(group) {
   // Submit first: the bundle is a free quote until it's paid. If the group
   // can't afford it, let it expire unpaid.
   const txs = p.edges.map((e) => ({ chain: e.from, target: e.sucker, data: SYNC_CALLDATA, value: e.value }));
-  const { bundleUuid, paymentInfo } = await submitPrepaidBundle(txs);
+  const { bundleUuid, paymentInfo, submittedTxs, dropped } = await submitDroppingRevertedEdges(txs);
+  const submittedEdges = p.edges.filter((e) =>
+    submittedTxs.some((t) => t.chain === e.from && t.target === e.sucker));
   const options = paymentInfo.filter((o) => BigInt(o.amount) > 0n);
   if (!options.length) throw new Error('relayr returned no payment options');
   const cheapest = options.reduce((min, o) => (BigInt(o.amount) < BigInt(min.amount) ? o : min));
@@ -72,7 +101,8 @@ export async function scanGroup(group) {
   const paid = await payRelayr(paymentInfo, group.network_class);
   const debit = paid.amount + PAYMENT_GAS_ALLOWANCE * gasPrice;
   const planRecord = {
-    edges: p.edges.map((e) => ({ from: e.from, to: e.to, sucker: e.sucker, value: e.value.toString(), family: e.family })),
+    edges: submittedEdges.map((e) => ({ from: e.from, to: e.to, sucker: e.sucker, value: e.value.toString(), family: e.family })),
+    dropped: dropped.length ? dropped : undefined,
     stale: stale.map((s) => ({ source: s.source, viewer: s.viewer, pct: s.pct })),
     payment: { chain: paid.chain, amount: paid.amount.toString(), hash: paid.hash },
   };

@@ -303,12 +303,9 @@ $('fd-send').onclick = async function () {
     out('fd-out', 'sent ' + hash + ' — waiting for a confirmation before claiming…');
     for (var i = 0; i < 60; i++) {
       await new Promise(function (r) { setTimeout(r, 5000); });
-      try {
-        var d = await claim(hash);
-        return out('fd-out', 'credited ' + fmtEth(d.credited) + ' — project balance now ' + fmtEth(d.balance));
-      } catch (e) {
-        if (!/confirmed|not found|not be found/i.test(e.message)) throw e;
-      }
+      var d = await claim(hash);
+      if (d.credited) return out('fd-out', 'credited ' + fmtEth(d.credited) + ' — project balance now ' + fmtEth(d.balance));
+      out('fd-out', 'sent ' + hash + ' — still waiting for a confirmation…');
     }
     out('fd-out', 'tx not confirmed yet — claim the hash manually below once it lands: ' + hash, true);
   } catch (e) { out('fd-out', e.message, true); }
@@ -316,6 +313,7 @@ $('fd-send').onclick = async function () {
 $('fd-claim').onclick = async function () {
   try {
     var d = await claim($('fd-hash').value.trim());
+    if (d.pending) return out('fd-out', d.message + ' — try again in a moment.');
     out('fd-out', 'credited ' + fmtEth(d.credited) + ' — project balance now ' + fmtEth(d.balance));
   } catch (e) { out('fd-out', e.message, true); }
 };

@@ -16,8 +16,11 @@ async function relayrFetch(path, opts = {}) {
   });
   if (!res.ok) {
     let detail = '';
-    try { detail = (await res.text()).slice(0, 300); } catch {}
-    throw new Error(`relayr ${opts.method || 'GET'} ${path} HTTP ${res.status}${detail ? `: ${detail}` : ''}`);
+    try { detail = await res.text(); } catch {}
+    const err = new Error(`relayr ${opts.method || 'GET'} ${path} HTTP ${res.status}${detail ? `: ${detail.slice(0, 300)}` : ''}`);
+    err.status = res.status;
+    err.body = detail;
+    throw err;
   }
   return res.json();
 }
