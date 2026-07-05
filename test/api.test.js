@@ -208,6 +208,36 @@ test('GET /activity merges registrations, deposits, and syncs with labels, newes
   assert.deepEqual(times, [...times].sort((x, y) => y - x));
 });
 
+test('admin reattribute-deposit moves a misfiled credit between groups', async () => {
+  // Register a second group to move the deposit to.
+  fx.walk = {
+    members: [{ chainId: 11155111, projectId: '7' }, { chainId: 84532, projectId: '11' }],
+    edges: [{ from: 11155111, to: 84532, sucker: '0xs2' }, { from: 84532, to: 11155111, sucker: '0xs2' }],
+    unsupported: [],
+  };
+  await api('POST', '/projects', { chainId: 11155111, projectId: '7', registrant: registrantAccount.address });
+
+  const move = (headers) => fetch(base + '/admin/reattribute-deposit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify({ txHash: '0xdd01', toChainId: 84532, toProjectId: '11' }),
+  });
+
+  assert.equal((await move({})).status, 404); // disabled without ADMIN_TOKEN
+  process.env.ADMIN_TOKEN = 'sekret';
+  assert.equal((await move({ 'x-admin-token': 'wrong' })).status, 403);
+
+  const ok = await move({ 'x-admin-token': 'sekret' });
+  assert.equal(ok.status, 200);
+  const body = await ok.json();
+  assert.equal(body.toGroup, '84532:11');
+  assert.equal(body.toBalance, (5n * 10n ** 18n).toString());
+
+  const from = await api('GET', '/projects/11155111/5');
+  assert.equal(from.body.balanceWei, '0'); // original group debited back
+  delete process.env.ADMIN_TOKEN;
+});
+
 test('GET /health reports loop state', async () => {
   const { status, body } = await api('GET', '/health');
   assert.equal(status, 200);

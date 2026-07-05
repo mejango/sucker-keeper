@@ -144,6 +144,24 @@ async function handle(req, res) {
     return json(res, result.pending ? 202 : 201, result);
   }
 
+  // Operator-only: fix a deposit claimed against the wrong project. Enabled
+  // by setting ADMIN_TOKEN in the environment; authenticated via x-admin-token.
+  if (req.method === 'POST' && url.pathname === '/admin/reattribute-deposit') {
+    if (!process.env.ADMIN_TOKEN) throw httpError(404, 'not found');
+    if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) throw httpError(403, 'bad admin token');
+    const body = await readBody(req);
+    const to = db.groupByMember(Number(body.toChainId), String(body.toProjectId));
+    if (!to) throw httpError(404, 'target project not registered');
+    const dep = db.reattributeDeposit(String(body.txHash), to.id);
+    return json(res, 200, {
+      moved: dep.amount_wei,
+      txHash: dep.tx_hash,
+      toGroup: to.group_key,
+      toBalance: db.groupById(to.id).balance_wei,
+      fromBalance: db.groupById(dep.group_id).balance_wei,
+    });
+  }
+
   if (parts[0] === 'projects' && parts.length === 3) {
     const group = db.groupByMember(Number(parts[1]), String(parts[2]));
     if (!group) throw httpError(404, 'not registered');

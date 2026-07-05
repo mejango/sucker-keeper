@@ -281,21 +281,31 @@ $('rg-btn').onclick = async function () {
 };
 
 // ---- fund ----
-function fundedName(d) {
-  var ref = chainName(Number($('fd-pchain').value)) + ' project ' + $('fd-project').value.trim();
-  return (d.label ? d.label + ' — ' : '') + ref + ' (group ' + d.groupKey + ')';
-}
-async function claim(txHash) {
-  return api('POST', '/deposits', {
-    txHash: txHash,
+function fundTarget() {
+  // Frozen at send time — editing the form while a tx is in flight must not
+  // redirect where the claim credits.
+  return {
     depositChainId: Number($('fd-chain').value),
     projectChainId: Number($('fd-pchain').value),
     projectId: $('fd-project').value.trim(),
+  };
+}
+function fundedName(d, t) {
+  var ref = chainName(t.projectChainId) + ' project ' + t.projectId;
+  return (d.label ? d.label + ' — ' : '') + ref + ' (group ' + d.groupKey + ')';
+}
+async function claim(txHash, t) {
+  return api('POST', '/deposits', {
+    txHash: txHash,
+    depositChainId: t.depositChainId,
+    projectChainId: t.projectChainId,
+    projectId: t.projectId,
   });
 }
 $('fd-send').onclick = async function () {
   try {
     if (!depositAddress) throw new Error('keeper unreachable');
+    var target = fundTarget();
     var from = await walletAccount();
     await walletSwitch($('fd-chain').value);
     var wei = BigInt(Math.round(parseFloat($('fd-amount').value) * 1e6)) * 1000000000000n;
@@ -307,8 +317,8 @@ $('fd-send').onclick = async function () {
     out('fd-out', 'sent ' + hash + ' — waiting for a confirmation before claiming…');
     for (var i = 0; i < 60; i++) {
       await new Promise(function (r) { setTimeout(r, 5000); });
-      var d = await claim(hash);
-      if (d.credited) return out('fd-out', 'credited ' + fmtEth(d.credited) + ' to ' + fundedName(d) + ' — its balance is now ' + fmtEth(d.balance));
+      var d = await claim(hash, target);
+      if (d.credited) return out('fd-out', 'credited ' + fmtEth(d.credited) + ' to ' + fundedName(d, target) + ' — its balance is now ' + fmtEth(d.balance));
       out('fd-out', 'sent ' + hash + ' — still waiting for a confirmation…');
     }
     out('fd-out', 'tx not confirmed yet — claim the hash manually below once it lands: ' + hash, true);
@@ -316,9 +326,10 @@ $('fd-send').onclick = async function () {
 };
 $('fd-claim').onclick = async function () {
   try {
-    var d = await claim($('fd-hash').value.trim());
+    var target = fundTarget();
+    var d = await claim($('fd-hash').value.trim(), target);
     if (d.pending) return out('fd-out', d.message + ' — try again in a moment.');
-    out('fd-out', 'credited ' + fmtEth(d.credited) + ' to ' + fundedName(d) + ' — its balance is now ' + fmtEth(d.balance));
+    out('fd-out', 'credited ' + fmtEth(d.credited) + ' to ' + fundedName(d, target) + ' — its balance is now ' + fmtEth(d.balance));
   } catch (e) { out('fd-out', e.message, true); }
 };
 

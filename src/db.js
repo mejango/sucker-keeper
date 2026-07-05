@@ -128,6 +128,18 @@ export function pendingSyncs() {
   return db.prepare("SELECT * FROM syncs WHERE state = 'submitted'").all();
 }
 
+// Operator remediation: move a deposit (and its credit) to another group —
+// e.g. a claim that was attributed to the wrong project id.
+export function reattributeDeposit(txHash, toGroupId) {
+  const dep = depositByHash(txHash);
+  if (!dep) throw new Error('deposit not found');
+  if (dep.group_id === Number(toGroupId)) throw new Error('deposit already attributed to that group');
+  adjustBalance(dep.group_id, -BigInt(dep.amount_wei));
+  adjustBalance(toGroupId, BigInt(dep.amount_wei));
+  db.prepare('UPDATE deposits SET group_id = ? WHERE tx_hash = ?').run(Number(toGroupId), dep.tx_hash);
+  return dep;
+}
+
 // Lifetime spend for a group: reconciled cost where available, else the
 // standing debit estimate of pending syncs.
 export function totalCostOf(groupId) {
