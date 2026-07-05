@@ -86,19 +86,21 @@ const agreeingSnapshots = () => new Map([
   [84532, { chainId: 84532, truth: account(84532, 500n), beliefs: new Map([[11155111, account(11155111, 1000n)]]) }],
 ]);
 
+const mkWalk = (sucker) => ({
+  members: MEMBERS,
+  edges: [
+    { from: 11155111, to: 84532, sucker },
+    { from: 84532, to: 11155111, sucker },
+  ],
+  unsupported: [],
+});
+
 let groupId;
 
 before(() => {
   db.init(join(mkdtempSync(join(tmpdir(), 'keeper-tick-')), 'tick.db'));
   groupId = db.createGroup({ groupKey: '84532:9', thresholdPct: 1, registrant: '0xabc0000000000000000000000000000000000001', networkClass: 'testnet', members: MEMBERS });
-  fx.walk = {
-    members: MEMBERS,
-    edges: [
-      { from: 11155111, to: 84532, sucker: '0xs1' },
-      { from: 84532, to: 11155111, sucker: '0xs1' },
-    ],
-    unsupported: [],
-  };
+  fx.walk = mkWalk('0xs1');
 });
 
 test('in-sync group: no submission, underfunded recovers to active', async () => {
@@ -145,6 +147,17 @@ test('stale + funded: pays, debits quote + gas allowance, records the sync', asy
   assert.equal(JSON.parse(sync.plan_json).payment.hash, '0xpayhash');
 });
 
+test('an edge synced recently is NOT re-paid while its bridge message is in flight', async () => {
+  // The previous test just submitted 11155111 -> 84532. The view is still
+  // stale (message hasn't landed), but a rescan must not buy it again.
+  fx.snapshots = divergedSnapshots();
+  const before = fx.submitted.length;
+  const r = await scanGroup(db.groupById(groupId));
+  assert.equal(r.submitted, undefined);
+  assert.ok(r.waiting >= 1);
+  assert.equal(fx.submitted.length, before);
+});
+
 test('mesh growth refreshes members and migrates the group key', async () => {
   const grown = [...MEMBERS, { chainId: 421614, projectId: '2' }];
   fx.walk = { ...fx.walk, members: grown };
@@ -177,6 +190,7 @@ test('finalizePending: success bundle reconciles to payment amount + actual gas'
 });
 
 test('finalizePending: failed tx marks the sync failed but still bills the payment', async () => {
+  fx.walk = mkWalk('0xf1'); // fresh edge — cooldown holds the previous one
   fx.snapshots = divergedSnapshots();
   await scanGroup(db.groupById(groupId));
   const pending = db.pendingSyncs().find((s) => s.group_id === groupId);
@@ -186,6 +200,7 @@ test('finalizePending: failed tx marks the sync failed but still bills the payme
 });
 
 test('finalizePending: unsettled fresh bundles are left alone', async () => {
+  fx.walk = mkWalk('0xf2');
   fx.snapshots = divergedSnapshots();
   await scanGroup(db.groupById(groupId));
   const pending = db.pendingSyncs().find((s) => s.group_id === groupId);
@@ -216,6 +231,7 @@ test('a SimulationReverted edge is dropped and the rest of the bundle resubmits'
 });
 
 test('non-simulation relayr failures still abort the scan for that group', async () => {
+  fx.walk = mkWalk('0xf3');
   fx.snapshots = divergedSnapshots();
   fx.submitErrors.push(Object.assign(new Error('relayr HTTP 500'), { status: 500, body: 'oops' }));
   await assert.rejects(() => scanGroup(db.groupById(groupId)), /HTTP 500/);
@@ -223,6 +239,7 @@ test('non-simulation relayr failures still abort the scan for that group', async
 
 test('payment failure surfaces as a scan error and nothing is debited', async () => {
   db.setStatus(groupId, 'active');
+  fx.walk = mkWalk('0xf4');
   const balanceBefore = db.groupById(groupId).balance_wei;
   fx.snapshots = divergedSnapshots();
   fx.payThrows = new Error('keeper wallet cannot cover the relayr payment on any chain');

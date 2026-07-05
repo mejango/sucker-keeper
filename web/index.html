@@ -216,7 +216,7 @@ function renderGroup(g) {
   var el = $('group-view');
   var html = '<div class="hint" style="margin-top:10px">group ' + groupRef(g) + ' ' +
     '<span class="badge ' + g.status + '">' + g.status + '</span> — balance ' + fmtEth(g.balanceWei) +
-    ' — threshold ' + g.thresholdPct + '%</div><ul>';
+    ' — spent ' + fmtEth(g.totalCostWei || 0) + ' all-time — threshold ' + g.thresholdPct + '%</div><ul>';
   g.members.forEach(function (m) {
     html += '<li>' + chainName(m.chainId) + ': project ' + m.projectId + '</li>';
   });

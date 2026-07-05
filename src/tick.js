@@ -18,6 +18,9 @@ const HOP_PENALTY = 10n ** 13n;
 // Gas allowance for the keeper's payment tx, reconciled to its receipt later.
 const PAYMENT_GAS_ALLOWANCE = 150_000n;
 const SYNC_TIMEOUT_S = 24 * 3600;
+// Longer than worst-case bridge delivery (CCIP ~20 min) so an edge isn't
+// re-paid while its message is still in flight.
+const EDGE_COOLDOWN_S = 30 * 60;
 
 // Relayr simulates every tx before quoting and 406s the WHOLE bundle if any
 // one reverts (e.g. a bridge fee that drifted past its pad). Rather than lose
@@ -77,13 +80,23 @@ export async function scanGroup(group) {
   }
 
   const p = plan({ edges: quoted, stale, pctOf, threshold: group.threshold_pct });
-  if (p.edges.length === 0) {
-    return { groupKey: freshKey, inSync: false, stale: stale.length, waiting: p.waiting.length, unreachable: p.unreachable };
+
+  // Bridge messages land slower than the scan interval (CCIP ~15-20 min vs
+  // 5-min scans). An edge synced recently still LOOKS necessary — the receiver
+  // hasn't heard yet — but paying again buys nothing. Cool synced edges down
+  // for longer than worst-case delivery before re-firing them.
+  const inFlight = db.recentSyncEdges(group.id, EDGE_COOLDOWN_S);
+  const fireable = p.edges.filter((e) => !inFlight.has(`${e.from}:${e.sucker}`));
+  if (fireable.length === 0) {
+    return {
+      groupKey: freshKey, inSync: false, stale: stale.length,
+      waiting: p.waiting.length + (p.edges.length - fireable.length), unreachable: p.unreachable,
+    };
   }
 
   // Submit first: the bundle is a free quote until it's paid. If the group
   // can't afford it, let it expire unpaid.
-  const txs = p.edges.map((e) => ({ chain: e.from, target: e.sucker, data: SYNC_CALLDATA, value: e.value }));
+  const txs = fireable.map((e) => ({ chain: e.from, target: e.sucker, data: SYNC_CALLDATA, value: e.value }));
   const { bundleUuid, paymentInfo, submittedTxs, dropped } = await submitDroppingRevertedEdges(txs);
   const submittedEdges = p.edges.filter((e) =>
     submittedTxs.some((t) => t.chain === e.from && t.target === e.sucker));

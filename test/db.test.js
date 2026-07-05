@@ -59,6 +59,22 @@ test('sync lifecycle: submitted -> pending -> resolved', () => {
   assert.equal(row.final_cost_wei, (4n * 10n ** 17n).toString());
 });
 
+test('totalCostOf sums reconciled cost, falling back to the standing estimate', () => {
+  const id = db.createGroup({ groupKey: '10:88', thresholdPct: 1, registrant: '0xabc0000000000000000000000000000000000009', networkClass: 'mainnet', members: [{ chainId: 10, projectId: '88' }] });
+  const s1 = db.insertSync({ groupId: id, plan: { edges: [] }, bundleUuid: 'c-1', quotedCostWei: 10n ** 15n });
+  db.resolveSync(s1, { state: 'success', finalCostWei: 8n * 10n ** 14n }); // reconciled down
+  db.insertSync({ groupId: id, plan: { edges: [] }, bundleUuid: 'c-2', quotedCostWei: 5n * 10n ** 14n }); // still pending
+  assert.equal(db.totalCostOf(id), 13n * 10n ** 14n);
+});
+
+test('recentSyncEdges reports edges of recent non-failed syncs', () => {
+  const id = db.createGroup({ groupKey: '10:89', thresholdPct: 1, registrant: '0xabc000000000000000000000000000000000000a', networkClass: 'mainnet', members: [{ chainId: 10, projectId: '89' }] });
+  const s = db.insertSync({ groupId: id, plan: { edges: [{ from: 10, sucker: '0xaa' }] }, bundleUuid: 'e-1', quotedCostWei: 1n });
+  assert.ok(db.recentSyncEdges(id, 1800).has('10:0xaa'));
+  db.resolveSync(s, { state: 'failed', finalCostWei: 0n });
+  assert.ok(!db.recentSyncEdges(id, 1800).has('10:0xaa')); // failed syncs don't cool edges down
+});
+
 test('status transitions and threshold updates persist', () => {
   const group = db.groupByMember(11155111, '5');
   db.setStatus(group.id, 'underfunded');

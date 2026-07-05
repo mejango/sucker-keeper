@@ -128,8 +128,29 @@ export function pendingSyncs() {
   return db.prepare("SELECT * FROM syncs WHERE state = 'submitted'").all();
 }
 
+// Lifetime spend for a group: reconciled cost where available, else the
+// standing debit estimate of pending syncs.
+export function totalCostOf(groupId) {
+  const rows = db.prepare('SELECT COALESCE(final_cost_wei, quoted_cost_wei) AS c FROM syncs WHERE group_id = ?').all(Number(groupId));
+  return rows.reduce((s, r) => s + BigInt(r.c || 0), 0n);
+}
+
 export function syncsOf(groupId, limit = 20) {
   return db.prepare('SELECT * FROM syncs WHERE group_id = ? ORDER BY created_at DESC, id DESC LIMIT ?').all(Number(groupId), limit);
+}
+
+// Edges included in this group's recent non-failed syncs — used to avoid
+// re-paying for bridge messages that are still in flight.
+export function recentSyncEdges(groupId, sinceSeconds) {
+  const rows = db.prepare(`
+    SELECT plan_json FROM syncs
+    WHERE group_id = ? AND state != 'failed' AND created_at > unixepoch() - ?
+  `).all(Number(groupId), sinceSeconds);
+  const edges = new Set();
+  for (const r of rows) {
+    for (const e of JSON.parse(r.plan_json).edges || []) edges.add(`${e.from}:${e.sucker}`);
+  }
+  return edges;
 }
 
 // Merged service-wide feed for the landing page: syncs, deposits, and

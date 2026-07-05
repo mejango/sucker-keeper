@@ -39,6 +39,7 @@ function groupView(group) {
     registrant: group.registrant_address,
     networkClass: group.network_class,
     balanceWei: group.balance_wei,
+    totalCostWei: db.totalCostOf(group.id).toString(),
     status: group.status,
     syncs: db.syncsOf(group.id).map((s) => ({
       state: s.state, bundleUuid: s.relayr_bundle_uuid, quotedCostWei: s.quoted_cost_wei,
