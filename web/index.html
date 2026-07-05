@@ -154,11 +154,19 @@ async function walletSwitch(chainId) {
   await window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: '0x' + Number(chainId).toString(16) }] });
 }
 
-// ---- chain selects ----
-Object.entries({ 'lk-chain': 0, 'rg-chain': 0, 'fd-pchain': 0, 'fd-chain': 0, 'th-chain': 0 }).forEach(function (e) {
-  var sel = $(e[0]);
-  Object.keys(CHAINS).forEach(function (id) {
-    var o = document.createElement('option'); o.value = id; o.textContent = chainName(id); sel.appendChild(o);
+// ---- chain selects: mainnets first, then testnets ----
+var CHAIN_GROUPS = [
+  ['mainnets', [1, 10, 8453, 42161]],
+  ['testnets', [11155111, 11155420, 84532, 421614]],
+];
+['lk-chain', 'rg-chain', 'fd-pchain', 'fd-chain', 'th-chain'].forEach(function (id) {
+  var sel = $(id);
+  CHAIN_GROUPS.forEach(function (g) {
+    var grp = document.createElement('optgroup'); grp.label = g[0];
+    g[1].forEach(function (cid) {
+      var o = document.createElement('option'); o.value = cid; o.textContent = chainName(cid); grp.appendChild(o);
+    });
+    sel.appendChild(grp);
   });
 });
 
