@@ -1,0 +1,16 @@
+{
+  "name": "keeper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Keeps omnichain Juicebox projects' sucker accounting in sync across chains via Relayr.",
+  "engines": { "node": ">=23.4" },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --experimental-test-module-mocks --test 'test/*.test.js'",
+    "smoke": "node scripts/smoke.js"
+  },
+  "dependencies": {
+    "viem": "^2.21.0"
+  }
+}
