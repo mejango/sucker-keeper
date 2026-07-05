@@ -67,6 +67,14 @@ Every `SCAN_INTERVAL` (default 5 min), for each `active` group:
 3. Divergence: for every ordered pair (source S, viewer V): compare V's stored record of S against S's own record, field-by-field (`totalSupply`, each context's `surplus` and `balance`). `diff% = |actual − believed| / max(actual, 1)`. V having **no record** of S while S has nonzero supply counts as 100% divergent. Any field ≥ threshold → stale pair `(S, V)`.
 4. If any stale pairs and balance covers the plan estimate → plan and execute. If balance is short → mark `underfunded` (recovers automatically on deposit).
 
+## Cost philosophy
+
+The keeper minimizes lifetime sync cost, not per-round latency:
+
+- **Space**: hub-consolidated routing with execution-gas-priced edges — Ethereum L1 sees ideally one inbound and one outbound sync per round; L2s gossip the rest.
+- **Time**: gas prices are sampled every scan into a 7-day per-chain history. A mainnet group whose mesh touches L1 defers its sync until L1 gas falls below its 35th percentile — unless divergence reaches 3x the triggering threshold (urgent) or the group has already waited 12 hours (capped patience). Testnets and L2-only meshes never wait.
+- **No waste**: in-flight edge cooldowns (never re-pay a bridge message still traveling), sim-revert backoff (route around edges Relayr won't simulate), exact pre-payment quotes, receipt-level reconciliation, and free scans while in sync.
+
 ## Gossip-aware planning (the economical part)
 
 Goal: the cheapest ordered set of `syncAccountingData()` calls such that, after propagation, every stale `(S, V)` view is refreshed.

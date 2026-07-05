@@ -5,7 +5,7 @@
 // the sync.
 import { encodeFunctionData } from 'viem';
 import * as db from './db.js';
-import { clientFor, isL1 } from './chains.js';
+import { clientFor, CHAINS } from './chains.js';
 import { SUCKER_ABI } from './abi.js';
 import { walkGroup, snapshotGroup, groupKeyOf } from './mesh.js';
 import { divergenceMatrix, stalePairs } from './monitor.js';
@@ -27,6 +27,28 @@ const SYNC_TIMEOUT_S = 24 * 3600;
 // Longer than worst-case bridge delivery (CCIP ~20 min) so an edge isn't
 // re-paid while its message is still in flight.
 const EDGE_COOLDOWN_S = 30 * 60;
+
+// --- cheap-hour timing ---
+// Ethereum L1 gas swings several-fold across the day. A view that is barely
+// past threshold can wait for a quiet hour; one that is far past it cannot.
+// Deferral applies only to mainnet groups whose mesh touches L1, is bounded
+// by MAX_DEFER_S from the moment the group went stale, and needs a real
+// baseline (2+ days of samples) before it trusts "typical" gas.
+const GAS_CHEAP_PCT = 0.35; // fire when L1 gas is below its 35th percentile
+const URGENT_MULTIPLE = 3; // divergence >= 3x threshold syncs regardless
+const MAX_DEFER_S = 12 * 3600;
+const L1_CHAIN = 1;
+
+// Pure decision, exported for tests.
+export function shouldDeferForGas({ networkClass, touchesL1, urgency, gasNow, gasCheap, staleSince, now }) {
+  if (networkClass !== 'mainnet') return false; // testnet gas is worthless
+  if (!touchesL1) return false; // L2-only plans are cheap at any hour
+  if (urgency >= URGENT_MULTIPLE) return false;
+  if (gasCheap == null) return false; // no baseline yet
+  if (gasNow <= gasCheap) return false; // it IS the cheap hour
+  if (staleSince != null && now - staleSince >= MAX_DEFER_S) return false; // waited long enough
+  return true;
+}
 
 // Edges whose Relayr simulation reverted recently. Observed live: native
 // eth->arb retryables pass our eth_call probe (even at 2x) yet keep reverting
@@ -111,8 +133,30 @@ export async function scanGroup(group) {
   const snapshots = await snapshotGroup(walk.members);
   const matrix = divergenceMatrix(snapshots);
   const stale = stalePairs(matrix, threshold);
-  if (stale.length === 0) return { groupKey: freshKey, inSync: true };
+  if (stale.length === 0) {
+    if (group.stale_since != null) db.setStaleSince(group.id, null);
+    return { groupKey: freshKey, inSync: true };
+  }
   const maxStalePct = Math.max(...stale.map((r) => r.pct));
+  const now = Math.floor(Date.now() / 1000);
+  if (group.stale_since == null) db.setStaleSince(group.id, now);
+
+  // Cheap-hour timing: patient drift waits for off-peak L1 gas.
+  const touchesL1 = walk.members.some((m) => Number(m.chainId) === L1_CHAIN);
+  if (touchesL1 && group.network_class === 'mainnet') {
+    const gasNow = await clientFor(L1_CHAIN).getGasPrice();
+    const gasCheap = db.gasPercentile(L1_CHAIN, GAS_CHEAP_PCT);
+    if (shouldDeferForGas({
+      networkClass: group.network_class, touchesL1, urgency: maxStalePct / threshold,
+      gasNow, gasCheap, staleSince: group.stale_since ?? now, now,
+    })) {
+      return {
+        groupKey: freshKey, inSync: false, stale: stale.length,
+        deferred: 'waiting-for-cheaper-l1-gas',
+        gasNowWei: gasNow.toString(), gasCheapWei: gasCheap.toString(),
+      };
+    }
+  }
 
   const pctByPair = new Map(matrix.map((r) => [`${r.source}:${r.viewer}`, r.pct]));
   const pctOf = (source, viewer) => pctByPair.get(`${source}:${viewer}`) ?? 100;
@@ -197,6 +241,11 @@ export async function scanGroup(group) {
 }
 
 export async function scanAll() {
+  // Sample gas on every tick so deferral decisions have a real baseline.
+  await Promise.all(Object.keys(CHAINS).map(async (id) => {
+    try { db.sampleGas(id, await clientFor(id).getGasPrice()); } catch {}
+  }));
+
   const results = [];
   for (const group of db.activeGroups()) {
     try {

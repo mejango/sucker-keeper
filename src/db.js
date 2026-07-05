@@ -43,6 +43,12 @@ export function init(path = process.env.DB_PATH || './keeper.db') {
       created_at INTEGER NOT NULL DEFAULT (unixepoch()),
       UNIQUE (group_id, sponsor_address)
     );
+    CREATE TABLE IF NOT EXISTS gas_samples (
+      chain_id INTEGER NOT NULL,
+      at INTEGER NOT NULL DEFAULT (unixepoch()),
+      price_wei TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_gas_samples ON gas_samples (chain_id, at);
     CREATE TABLE IF NOT EXISTS syncs (
       id INTEGER PRIMARY KEY,
       group_id INTEGER NOT NULL REFERENCES groups(id),
@@ -55,6 +61,9 @@ export function init(path = process.env.DB_PATH || './keeper.db') {
       resolved_at INTEGER
     );
   `);
+  // stale_since tracks how long a group has been out of sync, bounding how
+  // long gas-price deferral may postpone its syncs.
+  try { db.exec('ALTER TABLE groups ADD COLUMN stale_since INTEGER'); } catch {}
   // Migration from the single-registrant model: seed each group's first
   // sponsorship from its legacy registrant/threshold/balance columns.
   db.exec(`
@@ -215,6 +224,26 @@ export function totalCostOf(groupId) {
 
 export function syncsOf(groupId, limit = 20) {
   return db.prepare('SELECT * FROM syncs WHERE group_id = ? ORDER BY created_at DESC, id DESC LIMIT ?').all(Number(groupId), limit);
+}
+
+export function setStaleSince(groupId, at) {
+  db.prepare('UPDATE groups SET stale_since = ? WHERE id = ?').run(at, Number(groupId));
+}
+
+// ---- gas samples: per-chain price history for cheap-hour timing ----
+
+export function sampleGas(chainId, priceWei) {
+  db.prepare('INSERT INTO gas_samples (chain_id, price_wei) VALUES (?, ?)').run(Number(chainId), priceWei.toString());
+  // ponytail: prune inline — a few rows per scan, one delete keeps it tidy.
+  db.prepare("DELETE FROM gas_samples WHERE at < unixepoch() - 7 * 86400").run();
+}
+
+// The price at the given percentile of the last 7 days, or null when the
+// baseline is too thin to be meaningful.
+export function gasPercentile(chainId, pct, minSamples = 48) {
+  const rows = db.prepare('SELECT price_wei FROM gas_samples WHERE chain_id = ? ORDER BY CAST(price_wei AS REAL)').all(Number(chainId));
+  if (rows.length < minSamples) return null;
+  return BigInt(rows[Math.min(Math.floor(rows.length * pct), rows.length - 1)].price_wei);
 }
 
 // Edges included in this group's recent non-failed syncs — used to avoid

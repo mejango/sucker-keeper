@@ -31,6 +31,8 @@ GET  /health
 
 Each scan (default 5 min) the keeper walks the group's sucker mesh, snapshots every chain in one `eth_call` (`JBSuckerLib.buildAccountingSnapshot` returns the chain's own record *plus* its stored beliefs about every peer), and computes the divergence matrix. For stale views it plans the cheapest edge SET through the mesh — per-pair shortest paths versus consolidation through a hub chain, whichever prices lower on unique edges (edge costs include origin-chain execution gas, so Ethereum L1 ideally sees one inbound and one outbound sync per round while L2s gossip the rest) and submits one Relayr prepaid bundle with the edges that are ready this round, paid from the keeper's own wallet — multi-hop propagation continues on later scans as bridge messages land. Relayr quotes the exact bundle cost before payment; groups are debited that quote plus payment gas, reconciled to receipts. At cost, no margin.
 
+The keeper also times its spending: gas prices are sampled continuously, and a mainnet sync whose mesh touches Ethereum L1 waits for off-peak gas (below the 7-day 35th percentile) unless divergence is 3x past threshold or it has already waited 12 hours.
+
 Bridge specifics the planner knows: OP-family accounting sends take `value = 0`; Arbitrum L1→L2 retryables need a small fee (quoted by eth_call probe); CCIP fees are quoted the same way with a 5% pad; native-bridge L2→L1 messages don't self-deliver (prove/finalize, outbox) so those edges are excluded — L1 views refresh via CCIP.
 
 ## Run
