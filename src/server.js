@@ -100,6 +100,7 @@ async function handle(req, res) {
       depositAddress: keeperAddress(),
       walletBalances: url.searchParams.get('balances') ? await walletBalances() : undefined,
       groups: db.activeGroups().length,
+      lastScanResults: lastScan.results,
     });
   }
 

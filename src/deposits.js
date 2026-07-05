@@ -21,11 +21,20 @@ export async function claimDeposit({ txHash, chainId, projectChainId, projectId 
   if (db.depositByHash(txHash)) throw httpError(409, 'deposit already claimed');
 
   const client = clientFor(chainId);
-  const [tx, receipt, head] = await Promise.all([
-    client.getTransaction({ hash: txHash }),
-    client.getTransactionReceipt({ hash: txHash }),
-    client.getBlockNumber(),
-  ]);
+  let tx, receipt, head;
+  try {
+    [tx, receipt, head] = await Promise.all([
+      client.getTransaction({ hash: txHash }),
+      client.getTransactionReceipt({ hash: txHash }),
+      client.getBlockNumber(),
+    ]);
+  } catch (err) {
+    // Expected while the tx is still pending — the UI polls and retries.
+    if (/could not be found|not be processed/i.test(err.message || '')) {
+      throw httpError(404, 'tx not yet confirmed on the claimed chain — retry shortly');
+    }
+    throw err;
+  }
   if (receipt.status !== 'success') throw httpError(400, 'tx reverted');
   if (tx.to?.toLowerCase() !== depositAddress) throw httpError(400, 'tx is not a transfer to the deposit address');
   if (tx.value === 0n) throw httpError(400, 'tx carries no value');
